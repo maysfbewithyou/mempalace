@@ -257,6 +257,28 @@ class StdioProxy:
         async with self._lock:
             return await self._request_locked(payload)
 
+    async def notify(self, payload: dict[str, Any]) -> None:
+        """Send a JSON-RPC notification (fire-and-forget). No response read.
+
+        Per JSON-RPC 2.0 §4.1, notifications carry no `id` and produce no
+        response. We MUST NOT read from stdout here, or we'd consume the
+        response of the next real request and crash the session.
+        """
+        async with self._lock:
+            if not self._proc or self._proc.returncode is not None:
+                await self._restart()
+            proc = self._proc
+            assert proc is not None
+            assert proc.stdin is not None
+
+            line = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+            try:
+                proc.stdin.write(line)
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                logger.warning("stdio_proxy: notify stdin write failed (%s); restarting", exc)
+                await self._restart()
+
     async def _request_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not self._proc or self._proc.returncode is not None:
             await self._restart()
@@ -439,11 +461,18 @@ async def ready(request: Request) -> Response:
 
 
 async def mcp(request: Request) -> Response:
-    """JSON-RPC over HTTP POST.
+    """JSON-RPC over HTTP POST per MCP Streamable HTTP transport.
 
-    MCP Streamable HTTP transport per the spec: client POSTs JSON-RPC, server
-    returns JSON-RPC. v0.1 supports single-message responses only (no SSE
-    streaming); upstream's tools all return single results, so JSON suffices.
+    Two payload types are handled:
+      - Requests (have `id` field): forward to subprocess, return JSON response.
+      - Notifications (have `method` but no `id`): forward to subprocess
+        fire-and-forget, return 202 Accepted with no body. Required by the MCP
+        Streamable HTTP spec — without this, our subprocess proxy would block
+        waiting for a response that JSON-RPC notifications never produce, and
+        the next legitimate request (e.g. tools/list) would hang or fail.
+
+    v0.1 supports single-message responses only (no SSE streaming); upstream's
+    tools all return single results, so JSON suffices.
     """
     try:
         payload = await request.json()
@@ -468,6 +497,18 @@ async def mcp(request: Request) -> Response:
         )
 
     proxy = _get_proxy()
+
+    # Notification (JSON-RPC 2.0 §4.1: Notification = no `id` field).
+    # Per MCP Streamable HTTP spec: forward without waiting, return 202 Accepted.
+    is_notification = "id" not in payload and "method" in payload
+    if is_notification:
+        try:
+            await proxy.notify(payload)
+        except Exception:  # noqa: BLE001
+            logger.exception("mcp: notification forward failed (continuing)")
+        # 202 Accepted with no body, per spec.
+        return Response(status_code=202)
+
     try:
         response = await proxy.request(payload)
     except asyncio.TimeoutError:
