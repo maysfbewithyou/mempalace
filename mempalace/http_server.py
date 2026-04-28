@@ -362,6 +362,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     PUBLIC_PATHS = (
         "/health",
         "/ready",
+        "/authorize",  # OAuth 2.0 §4.1.1 — pre-token endpoint, no bearer expected
         "/oauth/token",
         "/.well-known/oauth-authorization-server",
         "/.well-known/oauth-protected-resource",
@@ -533,8 +534,9 @@ def create_app(bearer_token: str | None = None) -> Starlette:
             # Status probes (no auth)
             Route("/health", health, methods=["GET"]),
             Route("/ready", ready, methods=["GET"]),
-            # OAuth 2.0/2.1 endpoints (no auth on the endpoints themselves —
-            # /oauth/token validates client credentials in its body)
+            # OAuth 2.0/2.1 endpoints (no bearer required; the auth flow
+            # provides its own credentials).
+            Route("/authorize", _oauth.authorize_endpoint, methods=["GET"]),
             Route("/oauth/token", _oauth.token_endpoint, methods=["POST"]),
             Route(
                 "/.well-known/oauth-authorization-server",
