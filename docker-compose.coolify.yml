@@ -27,15 +27,16 @@ services:
     restart: unless-stopped
 
     # ── Auth and config ────────────────────────────────────────────────
+    # Using the array form (with no value for MEMPALACE_BEARER_TOKEN) so
+    # Coolify's runtime env injection fills it in. The map form
+    # `MEMPALACE_BEARER_TOKEN: ${MEMPALACE_BEARER_TOKEN}` substitutes from
+    # the compose shell BEFORE Coolify can inject, which silently resolves
+    # to empty and crashes the wrapper at startup.
     environment:
-      # REQUIRED — set in Coolify secret store. The wrapper refuses to start
-      # without this and fails fast with a clear error.
-      MEMPALACE_BEARER_TOKEN: ${MEMPALACE_BEARER_TOKEN}
-      # Where the palace lives inside the container (under HOME=/data per Dockerfile,
-      # so Hardening Fix #14's under-$HOME check passes).
-      MEMPAL_PALACE_PATH: /data/.mempalace/palace
-      PYTHONUNBUFFERED: "1"
-      LOG_LEVEL: INFO
+      - MEMPALACE_BEARER_TOKEN
+      - MEMPAL_PALACE_PATH=/data/.mempalace/palace
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
 
     # ── Networking ─────────────────────────────────────────────────────
     # cloudflared runs on the Coolify host and routes Cloudflare tunnel
