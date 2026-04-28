@@ -179,6 +179,22 @@ def bootstrap_if_needed(palace_path: Path) -> None:
     else:
         logger.debug("bootstrap: identity.txt already present at %s", identity_path)
 
+    # ChromaDB collection — pre-create so mempalace_status doesn't return
+    # "No palace found" on a fresh deploy. Without this, the palace directory
+    # only materializes on the first write (mempalace_add_drawer), which means
+    # any read tool called before a write errors out unhelpfully.
+    try:
+        import chromadb  # lazy import; chromadb is large
+
+        palace_path.mkdir(parents=True, exist_ok=True)
+        client = chromadb.PersistentClient(path=str(palace_path))
+        client.get_or_create_collection("mempalace_drawers")
+        logger.info("bootstrap: chromadb collection ensured at %s", palace_path)
+    except Exception as exc:  # noqa: BLE001
+        # Don't fail bootstrap on chromadb init issues — log and continue.
+        # Worst case: first read tool returns "No palace found" until a write happens.
+        logger.warning("bootstrap: chromadb init skipped (%s)", exc)
+
 
 # ── StdioProxy ───────────────────────────────────────────────────────────────
 class StdioProxy:
