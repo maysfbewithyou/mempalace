@@ -54,16 +54,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root user — uid 1000 matches the typical Coolify volume ownership.
-RUN groupadd -g 1000 mempalace \
-    && useradd -u 1000 -g 1000 -d /data -s /bin/bash mempalace \
-    && mkdir -p /data/.mempalace /data/.cache \
-    && chown -R mempalace:mempalace /data
+# Volume ownership note:
+# The original Dockerfile created a non-root user (mempalace:1000) and chown'd
+# /data in the image. That works for `docker run --rm` testing, but on Coolify
+# (and any setup mounting a fresh named volume to /data), Docker overrides the
+# image-set ownership with the volume's existing ownership (root 0:0), and the
+# non-root user can no longer write to /data — container crashes silently
+# before logs flush. Fix: run as root in v1. Defense-in-depth via an entrypoint
+# script that chowns /data and drops privileges is a nice-to-have for v2.
+RUN mkdir -p /data/.mempalace /data/.cache
 
 # Copy the venv built in stage 1.
 COPY --from=builder /venv /venv
-
-USER mempalace
 
 ENV PATH=/venv/bin:$PATH \
     HOME=/data \
