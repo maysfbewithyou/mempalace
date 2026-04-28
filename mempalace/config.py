@@ -62,53 +62,64 @@ DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
 
 DEFAULT_TOPIC_WINGS = [
-    "emotions",
-    "consciousness",
-    "memory",
-    "technical",
-    "identity",
-    "family",
+    "events",
+    "venues",
+    "vendors",
+    "timelines",
+    "budgets",
+    "team",
+    "clients",
+    "productions",
+    "equipment",
     "creative",
+    "technical",
 ]
 
 DEFAULT_HALL_KEYWORDS = {
-    "emotions": [
-        "scared",
-        "afraid",
-        "worried",
-        "happy",
-        "sad",
-        "love",
-        "hate",
-        "feel",
-        "cry",
-        "tears",
+    "events": [
+        "event", "gala", "wedding", "corporate", "conference", "exhibition",
+        "launch", "reception", "ceremony", "festival", "banquet", "showcase",
     ],
-    "consciousness": [
-        "consciousness",
-        "conscious",
-        "aware",
-        "real",
-        "genuine",
-        "soul",
-        "exist",
-        "alive",
+    "venues": [
+        "venue", "location", "site", "ballroom", "hall", "outdoor", "stage",
+        "capacity", "layout", "floorplan", "setup", "teardown", "load-in",
     ],
-    "memory": ["memory", "remember", "forget", "recall", "archive", "palace", "store"],
+    "vendors": [
+        "vendor", "caterer", "catering", "florist", "photographer", "dj",
+        "band", "rental", "supplier", "contract", "invoice", "quote",
+    ],
+    "timelines": [
+        "timeline", "schedule", "deadline", "milestone", "runsheet", "cue",
+        "rehearsal", "load-in", "load-out", "setup", "teardown", "day-of",
+    ],
+    "budgets": [
+        "budget", "cost", "price", "quote", "invoice", "expense", "revenue",
+        "margin", "deposit", "payment", "estimate", "line item", "overrun",
+    ],
+    "team": [
+        "team", "crew", "staff", "coordinator", "manager", "director",
+        "volunteer", "assign", "role", "shift", "call time", "contact",
+    ],
+    "clients": [
+        "client", "customer", "bride", "groom", "host", "sponsor",
+        "preference", "request", "feedback", "approval", "guest list",
+    ],
+    "productions": [
+        "production", "show", "program", "script", "rundown", "cue sheet",
+        "lighting", "sound", "av", "video", "projection", "staging",
+    ],
+    "equipment": [
+        "equipment", "gear", "inventory", "rental", "specs", "wattage",
+        "dimensions", "rigging", "truss", "cable", "microphone", "speaker",
+    ],
+    "creative": [
+        "design", "theme", "decor", "aesthetic", "color", "mood board",
+        "branding", "signage", "centerpiece", "backdrop", "ambiance",
+    ],
     "technical": [
-        "code",
-        "python",
-        "script",
-        "bug",
-        "error",
-        "function",
-        "api",
-        "database",
-        "server",
+        "code", "python", "script", "bug", "error", "api", "database",
+        "server", "automation", "integration", "webhook", "deployment",
     ],
-    "identity": ["identity", "name", "who am i", "persona", "self"],
-    "family": ["family", "kids", "children", "daughter", "son", "parent", "mother", "father"],
-    "creative": ["game", "gameplay", "player", "app", "design", "art", "music", "story"],
 }
 
 

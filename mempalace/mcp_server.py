@@ -19,16 +19,19 @@ Tools (write):
 
 import argparse
 import os
+import re
 import sys
 import json
 import logging
 import hashlib
+import time
 from datetime import datetime
 from pathlib import Path
 
 from .config import MempalaceConfig, sanitize_name, sanitize_content
 from .version import __version__
 from .searcher import search_memories
+from .query_sanitizer import sanitize_query
 from .palace_graph import traverse, find_tunnels, graph_stats
 import chromadb
 
@@ -36,6 +39,51 @@ from .knowledge_graph import KnowledgeGraph
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 logger = logging.getLogger("mempalace_mcp")
+
+
+# ==================== RATE LIMITER ====================
+# Token bucket rate limiter for JSON-RPC requests
+
+
+class RateLimiter:
+    """Token bucket rate limiter for request throttling.
+
+    Allows a configurable number of requests per time period.
+    Default: 60 requests per minute (1 per second on average).
+    """
+
+    def __init__(self, rate: int = 60, period: int = 60):
+        """Initialize rate limiter.
+
+        Args:
+            rate: Number of requests allowed per period (default: 60)
+            period: Time period in seconds (default: 60 seconds = 1 minute)
+        """
+        self.rate = rate
+        self.period = period
+        self.tokens = float(rate)
+        self.last_update = time.time()
+
+    def allow_request(self) -> bool:
+        """Check if request should be allowed under rate limit.
+
+        Returns:
+            True if request is allowed, False if rate limit exceeded.
+        """
+        now = time.time()
+        elapsed = now - self.last_update
+
+        # Refill tokens based on elapsed time
+        self.tokens = min(
+            self.rate,
+            self.tokens + (elapsed * self.rate / self.period)
+        )
+        self.last_update = now
+
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False
 
 
 def _parse_args():
@@ -65,6 +113,7 @@ else:
 
 _client_cache = None
 _collection_cache = None
+_rate_limiter = RateLimiter(rate=60, period=60)  # 60 requests per minute
 
 
 # ==================== WRITE-AHEAD LOG ====================
@@ -98,6 +147,46 @@ def _wal_log(operation: str, params: dict, result: dict = None):
             pass
     except Exception as e:
         logger.error(f"WAL write failed: {e}")
+
+
+def _paginated_get_metadatas(col, where=None, page_size=2000):
+    """Fetch metadatas from collection in paginated batches.
+
+    Avoids loading all items into memory at once. Yields metadata dicts
+    one at a time or in small batches as they arrive from ChromaDB.
+
+    Args:
+        col: ChromaDB collection object
+        where: Optional where filter
+        page_size: Number of items per batch (default: 2000)
+
+    Yields:
+        Individual metadata dicts from the collection
+    """
+    offset = 0
+    while True:
+        kwargs = {
+            "include": ["metadatas"],
+            "offset": offset,
+            "limit": page_size,
+        }
+        if where:
+            kwargs["where"] = where
+
+        try:
+            result = col.get(**kwargs)
+            metadatas = result.get("metadatas", [])
+
+            if not metadatas:
+                break
+
+            for metadata in metadatas:
+                yield metadata
+
+            offset += page_size
+        except Exception as e:
+            logger.error(f"Pagination error at offset {offset}: {e}")
+            break
 
 
 _client_cache = None
@@ -144,8 +233,8 @@ def tool_status():
     wings = {}
     rooms = {}
     try:
-        all_meta = col.get(include=["metadatas"], limit=10000)["metadatas"]
-        for m in all_meta:
+        # Use pagination instead of limit=10000 to avoid memory issues
+        for m in _paginated_get_metadatas(col):
             w = m.get("wing", "unknown")
             r = m.get("room", "unknown")
             wings[w] = wings.get(w, 0) + 1
@@ -166,12 +255,13 @@ def tool_status():
 # Included in status response so the AI learns it on first wake-up call.
 # Also available via mempalace_get_aaak_spec tool.
 
-PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
+PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol (Interactive Event Productions):
 1. ON WAKE-UP: Call mempalace_status to load palace overview + AAAK spec.
-2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
-3. IF UNSURE about a fact (name, gender, age, relationship): say "let me check" and query the palace. Wrong is worse than slow.
-4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
-5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.
+2. BEFORE RESPONDING about any vendor, venue, client, event, or past decision: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
+3. IF UNSURE about a fact (vendor name, venue capacity, client preference, budget figure): say "let me check" and query the palace. Wrong is worse than slow.
+4. AFTER EACH SESSION: call mempalace_diary_write to record what happened — decisions made, vendor updates, timeline changes, budget approvals.
+5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one. Events evolve fast — keep the knowledge graph current.
+6. BEFORE CLIENT CALLS: search the palace for that client's history, preferences, and past event notes.
 
 This protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory."""
 
@@ -179,17 +269,17 @@ AAAK_SPEC = """AAAK is a compressed memory dialect that MemPalace uses for effic
 It is designed to be readable by both humans and LLMs without decoding.
 
 FORMAT:
-  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.
-  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.
-  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | ⚠: warnings/reminders.
-  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).
+  ENTITIES: 3-4 letter uppercase codes for people, events, and vendors.
+  EMOTIONS: *action markers* before/during text. *tense*=high-pressure, *triumphant*=successful event, *warm*=positive client feedback.
+  STRUCTURE: Pipe-separated fields. EVT: event | VEN: vendor | CLI: client | BUD: budget | ⚠: warnings/deadlines.
+  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 12x).
   IMPORTANCE: ★ to ★★★★★ (1-5 scale).
-  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.
-  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.
-  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).
+  HALLS: hall_event_decisions, hall_vendor_notes, hall_venue_specs, hall_budget_tracker, hall_client_preferences, hall_timeline_milestones, hall_production_notes, hall_diary.
+  WINGS: wing_events, wing_venues, wing_vendors, wing_timelines, wing_budgets, wing_team, wing_clients, wing_productions, wing_equipment, wing_creative, wing_technical.
+  ROOMS: Hyphenated slugs representing named ideas (e.g., gala-2026-spring, vendor-catering-selections, venue-ballroom-layout).
 
 EXAMPLE:
-  FAM: ALC→♡JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)
+  EVT: GALA2026 | VEN: GRNDBALL(cap:500,avail:Sat) | CLI: ACME(★★★★★,repeat) | BUD: $45K(approved) | ⚠:load-in-fri-2pm
 
 Read AAAK naturally — expand codes mentally, treat *markers* as emotional context.
 When WRITING AAAK: use entity codes, mark emotions, keep structure tight."""
@@ -201,8 +291,8 @@ def tool_list_wings():
         return _no_palace()
     wings = {}
     try:
-        all_meta = col.get(include=["metadatas"], limit=10000)["metadatas"]
-        for m in all_meta:
+        # Use pagination instead of limit=10000 to avoid memory issues
+        for m in _paginated_get_metadatas(col):
             w = m.get("wing", "unknown")
             wings[w] = wings.get(w, 0) + 1
     except Exception:
@@ -214,13 +304,16 @@ def tool_list_rooms(wing: str = None):
     col = _get_collection()
     if not col:
         return _no_palace()
+    if wing:
+        try:
+            wing = sanitize_name(wing, "wing")
+        except ValueError as e:
+            return {"error": str(e)}
     rooms = {}
     try:
-        kwargs = {"include": ["metadatas"], "limit": 10000}
-        if wing:
-            kwargs["where"] = {"wing": wing}
-        all_meta = col.get(**kwargs)["metadatas"]
-        for m in all_meta:
+        # Use pagination instead of limit=10000 to avoid memory issues
+        where = {"wing": wing} if wing else None
+        for m in _paginated_get_metadatas(col, where=where):
             r = m.get("room", "unknown")
             rooms[r] = rooms.get(r, 0) + 1
     except Exception:
@@ -234,8 +327,8 @@ def tool_get_taxonomy():
         return _no_palace()
     taxonomy = {}
     try:
-        all_meta = col.get(include=["metadatas"], limit=10000)["metadatas"]
-        for m in all_meta:
+        # Use pagination instead of limit=10000 to avoid memory issues
+        for m in _paginated_get_metadatas(col):
             w = m.get("wing", "unknown")
             r = m.get("room", "unknown")
             if w not in taxonomy:
@@ -246,20 +339,51 @@ def tool_get_taxonomy():
     return {"taxonomy": taxonomy}
 
 
-def tool_search(query: str, limit: int = 5, wing: str = None, room: str = None):
-    return search_memories(
-        query,
+def tool_search(query: str, limit: int = 5, wing: str = None, room: str = None, context: str = None):
+    """Semantic search with automatic query sanitization.
+
+    Args:
+        query: Search query. Keep this short and focused — do NOT include
+               system prompts, tool descriptions, or conversation context.
+        limit: Max results to return (default 5).
+        wing: Optional wing filter.
+        room: Optional room filter.
+        context: Optional background context (separated from the query to
+                 prevent contamination of semantic search).
+    """
+    try:
+        if wing:
+            wing = sanitize_name(wing, "wing")
+        if room:
+            room = sanitize_name(room, "room")
+    except ValueError as e:
+        return {"error": str(e)}
+    limit = max(1, min(limit, 50))  # Bound: 1-50 results
+    sanitized = sanitize_query(query, context=context)
+    result = search_memories(
+        sanitized.query,
         palace_path=_config.palace_path,
         wing=wing,
         room=room,
         n_results=limit,
     )
+    # Include sanitization metadata so callers can see what happened
+    if isinstance(result, dict):
+        result["_sanitization"] = {
+            "stage": sanitized.stage,
+            "stage_name": sanitized.stage_name,
+            "original_length": sanitized.original_length,
+            "sanitized_length": sanitized.sanitized_length,
+            "was_contaminated": sanitized.was_contaminated,
+        }
+    return result
 
 
 def tool_check_duplicate(content: str, threshold: float = 0.9):
     col = _get_collection()
     if not col:
         return _no_palace()
+    threshold = max(0.0, min(threshold, 1.0))  # Bound: 0.0-1.0
     try:
         results = col.query(
             query_texts=[content],
@@ -288,7 +412,8 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
             "matches": duplicates,
         }
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"Duplicate check error: {e}")
+        return {"error": "Duplicate check failed"}
 
 
 def tool_get_aaak_spec():
@@ -298,6 +423,11 @@ def tool_get_aaak_spec():
 
 def tool_traverse_graph(start_room: str, max_hops: int = 2):
     """Walk the palace graph from a room. Find connected ideas across wings."""
+    try:
+        start_room = sanitize_name(start_room, "start_room")
+    except ValueError as e:
+        return {"error": str(e)}
+    max_hops = max(1, min(max_hops, 10))  # Bound: 1-10 hops
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -306,6 +436,13 @@ def tool_traverse_graph(start_room: str, max_hops: int = 2):
 
 def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
     """Find rooms that bridge two wings — the hallways connecting domains."""
+    try:
+        if wing_a:
+            wing_a = sanitize_name(wing_a, "wing_a")
+        if wing_b:
+            wing_b = sanitize_name(wing_b, "wing_b")
+    except ValueError as e:
+        return {"error": str(e)}
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -378,11 +515,17 @@ def tool_add_drawer(
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
         return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        logger.error(f"Add drawer error ({wing}/{room}): {e}")
+        return {"success": False, "error": "Failed to file drawer"}
+
+
+_DRAWER_ID_RE = re.compile(r"^(drawer|diary)_[a-zA-Z0-9_]+_[a-f0-9]{12,24}$")
 
 
 def tool_delete_drawer(drawer_id: str):
     """Delete a single drawer by ID."""
+    if not isinstance(drawer_id, str) or not _DRAWER_ID_RE.match(drawer_id):
+        return {"success": False, "error": "Invalid drawer_id format"}
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -407,7 +550,8 @@ def tool_delete_drawer(drawer_id: str):
         logger.info(f"Deleted drawer: {drawer_id}")
         return {"success": True, "drawer_id": drawer_id}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        logger.error(f"Delete drawer error ({drawer_id}): {e}")
+        return {"success": False, "error": "Failed to delete drawer"}
 
 
 # ==================== KNOWLEDGE GRAPH ====================
@@ -415,6 +559,14 @@ def tool_delete_drawer(drawer_id: str):
 
 def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     """Query the knowledge graph for an entity's relationships."""
+    try:
+        entity = sanitize_name(entity, "entity")
+    except ValueError as e:
+        return {"error": str(e)}
+    if as_of and not re.match(r"^\d{4}-\d{2}-\d{2}$", as_of):
+        return {"error": "as_of must be ISO date format (YYYY-MM-DD)"}
+    if direction not in ("both", "outgoing", "incoming"):
+        return {"error": "direction must be 'both', 'outgoing', or 'incoming'"}
     results = _kg.query_entity(entity, as_of=as_of, direction=direction)
     return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
 
@@ -429,6 +581,8 @@ def tool_kg_add(
         object = sanitize_name(object, "object")
     except ValueError as e:
         return {"success": False, "error": str(e)}
+    if valid_from and not re.match(r"^\d{4}-\d{2}-\d{2}$", valid_from):
+        return {"success": False, "error": "valid_from must be ISO date format (YYYY-MM-DD)"}
 
     _wal_log(
         "kg_add",
@@ -448,6 +602,14 @@ def tool_kg_add(
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
     """Mark a fact as no longer true (set end date)."""
+    try:
+        subject = sanitize_name(subject, "subject")
+        predicate = sanitize_name(predicate, "predicate")
+        object = sanitize_name(object, "object")
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    if ended and not re.match(r"^\d{4}-\d{2}-\d{2}$", ended):
+        return {"success": False, "error": "ended must be ISO date format (YYYY-MM-DD)"}
     _wal_log(
         "kg_invalidate",
         {"subject": subject, "predicate": predicate, "object": object, "ended": ended},
@@ -462,6 +624,11 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
 
 def tool_kg_timeline(entity: str = None):
     """Get chronological timeline of facts, optionally for one entity."""
+    if entity:
+        try:
+            entity = sanitize_name(entity, "entity")
+        except ValueError as e:
+            return {"error": str(e)}
     results = _kg.timeline(entity)
     return {"entity": entity or "all", "timeline": results, "count": len(results)}
 
@@ -537,7 +704,8 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
             "timestamp": now.isoformat(),
         }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        logger.error(f"Diary write error for agent {agent_name}: {e}")
+        return {"success": False, "error": "Failed to write diary entry"}
 
 
 def tool_diary_read(agent_name: str, last_n: int = 10):
@@ -545,6 +713,11 @@ def tool_diary_read(agent_name: str, last_n: int = 10):
     Read an agent's recent diary entries. Returns the last N entries
     in chronological order — the agent's personal journal.
     """
+    try:
+        agent_name = sanitize_name(agent_name, "agent_name")
+    except ValueError as e:
+        return {"error": str(e)}
+    last_n = max(1, min(last_n, 100))  # Bound: 1-100 entries
     wing = f"wing_{agent_name.lower().replace(' ', '_')}"
     col = _get_collection()
     if not col:
@@ -582,7 +755,8 @@ def tool_diary_read(agent_name: str, last_n: int = 10):
             "showing": len(entries),
         }
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"Diary read error for agent {agent_name}: {e}")
+        return {"error": "Failed to read diary entries"}
 
 
 # ==================== MCP PROTOCOL ====================
@@ -931,6 +1105,21 @@ def main():
             line = line.strip()
             if not line:
                 continue
+
+            # Rate limit check
+            if not _rate_limiter.allow_request():
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32009,
+                        "message": "Rate limit exceeded (60 requests per minute)",
+                    },
+                }
+                sys.stdout.write(json.dumps(response) + "\n")
+                sys.stdout.flush()
+                continue
+
             request = json.loads(line)
             response = handle_request(request)
             if response is not None:

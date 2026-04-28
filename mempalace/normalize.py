@@ -147,8 +147,43 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
     return None
 
 
+def _extract_role_and_text(item: dict) -> tuple:
+    """Extract (role, text) from a message dict, handling multiple Claude.ai export formats.
+
+    Known field variations across Claude.ai export versions:
+        Role: "role", "sender", "author"
+        Text: "content", "text", "body"
+    Returns ("", "") if no valid role/text found.
+    """
+    if not isinstance(item, dict):
+        return ("", "")
+    # Try role field names in order of likelihood
+    role = (
+        item.get("role", "")
+        or item.get("sender", "")
+        or item.get("author", "")
+    )
+    # Try text field names — "content" first (may be str, list, or dict),
+    # then "text" (usually str), then "body" (some export variants)
+    text = ""
+    if "content" in item:
+        text = _extract_content(item["content"])
+    if not text and "text" in item:
+        text = _extract_content(item["text"])
+    if not text and "body" in item:
+        text = _extract_content(item["body"])
+    return (role, text)
+
+
 def _try_claude_ai_json(data) -> Optional[str]:
-    """Claude.ai JSON export: flat messages list or privacy export with chat_messages."""
+    """Claude.ai JSON export: flat messages list or privacy export with chat_messages.
+
+    Handles multiple export format versions:
+      - Flat list of messages with role/content fields
+      - Privacy export with nested chat_messages arrays
+      - Newer exports using sender/text instead of role/content
+      - Exports with uuid/created_at keyed messages
+    """
     if isinstance(data, dict):
         data = data.get("messages", data.get("chat_messages", []))
     if not isinstance(data, list):
@@ -162,10 +197,7 @@ def _try_claude_ai_json(data) -> Optional[str]:
                 continue
             chat_msgs = convo.get("chat_messages", [])
             for item in chat_msgs:
-                if not isinstance(item, dict):
-                    continue
-                role = item.get("role", "")
-                text = _extract_content(item.get("content", ""))
+                role, text = _extract_role_and_text(item)
                 if role in ("user", "human") and text:
                     all_messages.append(("user", text))
                 elif role in ("assistant", "ai") and text:
@@ -177,10 +209,7 @@ def _try_claude_ai_json(data) -> Optional[str]:
     # Flat messages list
     messages = []
     for item in data:
-        if not isinstance(item, dict):
-            continue
-        role = item.get("role", "")
-        text = _extract_content(item.get("content", ""))
+        role, text = _extract_role_and_text(item)
         if role in ("user", "human") and text:
             messages.append(("user", text))
         elif role in ("assistant", "ai") and text:

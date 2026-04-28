@@ -183,7 +183,20 @@ def _wikipedia_lookup(word: str) -> dict:
         url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(word)}"
         req = urllib.request.Request(url, headers={"User-Agent": "MemPalace/1.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
+            # Validate Content-Type header
+            content_type = resp.headers.get('Content-Type', '')
+            if 'application/json' not in content_type:
+                return {"inferred_type": "unknown", "confidence": 0.0, "wiki_summary": None}
+
+            # Parse JSON safely
+            try:
+                data = json.loads(resp.read())
+            except json.JSONDecodeError:
+                return {"inferred_type": "unknown", "confidence": 0.0, "wiki_summary": None}
+
+            # Validate schema — ensure expected keys exist
+            if not isinstance(data, dict):
+                return {"inferred_type": "unknown", "confidence": 0.0, "wiki_summary": None}
 
         page_type = data.get("type", "")
         extract = data.get("extract", "").lower()

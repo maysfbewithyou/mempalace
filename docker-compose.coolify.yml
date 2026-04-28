@@ -1,0 +1,83 @@
+# MemPalace IEP fork — Coolify service definition
+# version: 0.1
+# phase: 2c (this file is consumed by Coolify when we deploy)
+# locked architecture: MemPalace_Phase_2_Architecture_v0.2.md (A2, A4, A8)
+#
+# How Coolify uses this:
+#   - Coolify clones the repo, finds this file, and runs `docker compose up`
+#     inside its own managed environment (which provides traefik / proxy
+#     wiring and secrets injection).
+#   - The MEMPALACE_BEARER_TOKEN comes from Coolify's secret store, NOT from
+#     a committed .env file. Set it once in the Coolify UI before first deploy.
+#   - The Cloudflare tunnel (mempalace.tstly.dev → this container) is
+#     configured separately in 2d via the existing cloudflared service.
+#
+# Local smoke-test:
+#   echo "MEMPALACE_BEARER_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')" > .env.local
+#   docker compose -f docker-compose.coolify.yml --env-file .env.local up --build
+#   ./smoke_test.sh http://localhost:8000 "$(grep MEMPALACE_BEARER_TOKEN .env.local | cut -d= -f2)"
+
+services:
+  mempalace-http:
+    container_name: mempalace-http
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mempalace-iep:0.1
+    restart: unless-stopped
+
+    # ── Auth and config ────────────────────────────────────────────────
+    environment:
+      # REQUIRED — set in Coolify secret store. The wrapper refuses to start
+      # without this and fails fast with a clear error.
+      MEMPALACE_BEARER_TOKEN: ${MEMPALACE_BEARER_TOKEN}
+      # Where the palace lives inside the container (under HOME=/data per Dockerfile,
+      # so Hardening Fix #14's under-$HOME check passes).
+      MEMPAL_PALACE_PATH: /data/.mempalace/palace
+      PYTHONUNBUFFERED: "1"
+      LOG_LEVEL: INFO
+
+    # ── Networking ─────────────────────────────────────────────────────
+    # Coolify's proxy will ingest port 8000 and front it; the cloudflared
+    # service (configured in 2d) routes mempalace.tstly.dev to whatever
+    # internal hostname Coolify assigns. We expose 8000 only for local
+    # smoke-testing; remove or comment out before production deploy if
+    # Coolify provides its own ingress.
+    ports:
+      - "8000:8000"
+
+    # ── Persistent storage ─────────────────────────────────────────────
+    # ChromaDB palace, WAL, config.json, identity.txt all live under /data.
+    # Single named volume keeps backups simple.
+    volumes:
+      - mempalace_data:/data
+
+    # ── Health and resources (A8) ──────────────────────────────────────
+    # Compose-level healthcheck mirrors the Dockerfile HEALTHCHECK; Coolify
+    # uses the more granular timing here for restart decisions.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+
+    # Standard production logging knobs — keep last 10×10MB of stdout per
+    # container. Coolify's log viewer reads these too.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "10"
+
+# ── Volumes ───────────────────────────────────────────────────────────
+# Named volume; Coolify backs this up if backup is configured for the project.
+volumes:
+  mempalace_data:
+    name: mempalace_data

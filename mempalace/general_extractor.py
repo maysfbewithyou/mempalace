@@ -49,6 +49,14 @@ DECISION_MARKERS = [
     r"\bset (it |this )?to\b",
     r"\bconfigure\b",
     r"\bdefault\b",
+    # Event production decisions
+    r"\bchose (the )?(venue|vendor|caterer|florist|dj|band|photographer)\b",
+    r"\bselected (the )?(venue|vendor|caterer|theme|menu|package)\b",
+    r"\bapproved (the )?(budget|timeline|design|layout|menu|contract)\b",
+    r"\bconfirmed (the )?(date|time|venue|vendor|guest list|headcount)\b",
+    r"\bdecided on (the )?(venue|vendor|date|time|theme|menu|package)\b",
+    r"\bsigned (the |a )?(contract|agreement|vendor)\b",
+    r"\bbooked (the )?(venue|vendor|band|dj|photographer|caterer)\b",
 ]
 
 PREFERENCE_MARKERS = [
@@ -105,6 +113,16 @@ MILESTONE_MARKERS = [
     r"\bv\d+\.\d+",
     r"\d+x (compression|faster|slower|better|improvement|reduction)",
     r"\d+% (reduction|improvement|faster|better|smaller)",
+    # Event production milestones
+    r"\bvenue (confirmed|secured|booked|locked in)\b",
+    r"\bvendor (confirmed|signed|contracted|locked in)\b",
+    r"\bevent (planned|scheduled|confirmed|ready|completed|wrapped)\b",
+    r"\bequipment (delivered|installed|tested|ready|set up)\b",
+    r"\bload[- ]in (complete|done|finished)\b",
+    r"\brehearsal (done|complete|went well)\b",
+    r"\bguest (count|list) (finalized|confirmed|locked)\b",
+    r"\bsuccessful event\b",
+    r"\bevent went (well|great|smoothly)\b",
 ]
 
 PROBLEM_MARKERS = [

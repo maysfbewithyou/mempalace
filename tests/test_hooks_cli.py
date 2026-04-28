@@ -244,14 +244,16 @@ def test_maybe_auto_ingest_no_env(tmp_path):
 
 
 def test_maybe_auto_ingest_with_env(tmp_path):
-    """With MEMPAL_DIR set to a valid directory, spawns subprocess."""
+    """With MEMPAL_DIR set to a valid directory under HOME, spawns subprocess."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
-                _maybe_auto_ingest()
-                mock_popen.assert_called_once()
+            # Mock Path.home() so tmp_path appears to be under HOME
+            with patch("mempalace.hooks_cli.Path.home", return_value=tmp_path):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    _maybe_auto_ingest()
+                    mock_popen.assert_called_once()
 
 
 def test_maybe_auto_ingest_oserror(tmp_path):
@@ -260,8 +262,21 @@ def test_maybe_auto_ingest_oserror(tmp_path):
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-            with patch("mempalace.hooks_cli.subprocess.Popen", side_effect=OSError("fail")):
-                _maybe_auto_ingest()  # should not raise
+            with patch("mempalace.hooks_cli.Path.home", return_value=tmp_path):
+                with patch("mempalace.hooks_cli.subprocess.Popen", side_effect=OSError("fail")):
+                    _maybe_auto_ingest()  # should not raise
+
+
+def test_maybe_auto_ingest_rejects_tmp(tmp_path):
+    """MEMPAL_DIR outside HOME is rejected (security hardening)."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    # Don't mock Path.home — tmp_path is NOT under real HOME, so it should be rejected
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                _maybe_auto_ingest()
+                mock_popen.assert_not_called()
 
 
 # --- _parse_harness_input ---
@@ -332,16 +347,17 @@ def test_stop_hook_oserror_on_write(tmp_path):
 
 
 def test_precompact_with_mempal_dir(tmp_path):
-    """Precompact runs subprocess.run when MEMPAL_DIR is set."""
+    """Precompact runs subprocess.run when MEMPAL_DIR is set under HOME."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
-        with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
-            result = _capture_hook_output(
-                hook_precompact,
-                {"session_id": "test"},
-                state_dir=tmp_path,
-            )
+        with patch("mempalace.hooks_cli.Path.home", return_value=tmp_path):
+            with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                result = _capture_hook_output(
+                    hook_precompact,
+                    {"session_id": "test"},
+                    state_dir=tmp_path,
+                )
     assert result["decision"] == "block"
     mock_run.assert_called_once()
 
@@ -351,12 +367,13 @@ def test_precompact_with_mempal_dir_oserror(tmp_path):
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
-        with patch("mempalace.hooks_cli.subprocess.run", side_effect=OSError("fail")):
-            result = _capture_hook_output(
-                hook_precompact,
-                {"session_id": "test"},
-                state_dir=tmp_path,
-            )
+        with patch("mempalace.hooks_cli.Path.home", return_value=tmp_path):
+            with patch("mempalace.hooks_cli.subprocess.run", side_effect=OSError("fail")):
+                result = _capture_hook_output(
+                    hook_precompact,
+                    {"session_id": "test"},
+                    state_dir=tmp_path,
+                )
     assert result["decision"] == "block"
 
 

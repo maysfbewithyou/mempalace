@@ -57,7 +57,15 @@ MEMPAL_DIR=""
 # Read JSON input from stdin
 INPUT=$(cat)
 
-SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id','unknown'))" 2>/dev/null)
+# Parse session_id with sanitization — only allow alphanumeric, underscore, hyphen
+# Mirrors the save hook's sanitization to prevent path traversal via crafted session IDs
+SESSION_ID=$(echo "$INPUT" | python3 -c "
+import sys, json, re
+data = json.load(sys.stdin)
+sid = data.get('session_id', 'unknown')
+safe = re.sub(r'[^a-zA-Z0-9_\-]', '', str(sid))
+print(safe[:200] if safe else 'unknown')
+" 2>/dev/null)
 
 echo "[$(date '+%H:%M:%S')] PRE-COMPACT triggered for session $SESSION_ID" >> "$STATE_DIR/hook.log"
 
