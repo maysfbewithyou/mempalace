@@ -169,8 +169,16 @@ async def token_endpoint(request: Request) -> Response:
       - Authorization: Basic base64(client_id:client_secret)   (RFC 6749 §2.3.1)
       - POST body params: client_id=..., client_secret=...     (client_secret_post)
     """
+    # Parse application/x-www-form-urlencoded manually — Starlette's request.form()
+    # requires the python-multipart package even for urlencoded bodies, and we
+    # don't want that dependency just for the token endpoint.
+    from urllib.parse import parse_qs
+
     try:
-        form = await request.form()
+        raw = await request.body()
+        parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+        # parse_qs returns lists; flatten to first value
+        form = {k: (v[0] if v else "") for k, v in parsed.items()}
     except Exception:
         return JSONResponse(
             {"error": "invalid_request", "error_description": "Cannot parse form body"},
