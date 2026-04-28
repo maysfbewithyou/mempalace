@@ -38,16 +38,16 @@ services:
       LOG_LEVEL: INFO
 
     # ── Networking ─────────────────────────────────────────────────────
-    # We use `expose` (not `ports`) so port 8000 is reachable on the
-    # Docker network for Coolify's proxy and the Cloudflare tunnel, but
-    # NOT bound on the host. This avoids conflicts with other services
-    # on the Coolify host that may already use port 8000 (and removes
-    # the public-port surface entirely).
-    # The Cloudflare tunnel ingress rule (added in 2d) routes
-    # mempalace.tstly.dev → http://mempalace-http:8000 over the
-    # internal Docker network.
-    expose:
-      - "8000"
+    # cloudflared runs on the Coolify host and routes Cloudflare tunnel
+    # public hostnames → host ports (NOT into the Docker network). So we
+    # bind a unique host port. Port 5042 chosen to slot cleanly into the
+    # IEP fleet: cms-dev=5036, voice-mcp=5040, claude-brain=5042,
+    # tstly.dev=5050. (8000 is already allocated on the host by something
+    # else and conflicts; do not reuse.)
+    # Cloudflare public hostname `claude-brain.tstly.dev` → http://localhost:5042
+    # is configured separately in the cloudflared tunnel routes.
+    ports:
+      - "5042:8000"
 
     # ── Persistent storage ─────────────────────────────────────────────
     # ChromaDB palace, WAL, config.json, identity.txt all live under /data.
