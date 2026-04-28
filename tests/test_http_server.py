@@ -115,9 +115,10 @@ def test_health_does_not_require_auth(app_with_fake):
     assert r.text == "ok"
 
 
-def test_health_returns_503_when_subprocess_unhealthy(monkeypatch):
-    """Same lifespan-bypass approach as the app_with_fake fixture, inline so the
-    fake-healthy/unhealthy distinction is local to this test."""
+def test_health_returns_200_even_when_subprocess_unhealthy(monkeypatch):
+    """`/health` is a lightweight liveness check — it does NOT round-trip to the
+    StdioProxy. So even when the subprocess is unhealthy, /health returns 200.
+    The deep check is /ready (separate test below)."""
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
     from starlette.routing import Route
@@ -138,6 +139,58 @@ def test_health_returns_503_when_subprocess_unhealthy(monkeypatch):
 
     client = TestClient(test_app)
     r = client.get("/health")
+    assert r.status_code == 200
+    assert r.text == "ok"
+
+
+def test_ready_returns_200_when_subprocess_healthy(monkeypatch):
+    """`/ready` is the deep readiness check — round-trips to StdioProxy."""
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.routing import Route
+
+    fake = FakeProxy(healthy=True)
+    monkeypatch.setattr(http_server, "_proxy", fake)
+
+    test_app = Starlette(
+        debug=False,
+        routes=[Route("/ready", http_server.ready, methods=["GET"])],
+        middleware=[
+            Middleware(
+                http_server.BearerAuthMiddleware,
+                expected_token="x" * 32,
+            )
+        ],
+    )
+
+    client = TestClient(test_app)
+    r = client.get("/ready")
+    assert r.status_code == 200
+    assert r.text == "ready"
+
+
+def test_ready_returns_503_when_subprocess_unhealthy(monkeypatch):
+    """`/ready` returns 503 when the StdioProxy can't get a response."""
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.routing import Route
+
+    fake = FakeProxy(healthy=False)
+    monkeypatch.setattr(http_server, "_proxy", fake)
+
+    test_app = Starlette(
+        debug=False,
+        routes=[Route("/ready", http_server.ready, methods=["GET"])],
+        middleware=[
+            Middleware(
+                http_server.BearerAuthMiddleware,
+                expected_token="x" * 32,
+            )
+        ],
+    )
+
+    client = TestClient(test_app)
+    r = client.get("/ready")
     assert r.status_code == 503
 
 

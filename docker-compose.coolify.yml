@@ -59,11 +59,16 @@ services:
     # Compose-level healthcheck mirrors the Dockerfile HEALTHCHECK; Coolify
     # uses the more granular timing here for restart decisions.
     healthcheck:
+      # /health is a lightweight liveness check (returns ok if the wrapper
+      # process is alive — does NOT round-trip to the StdioProxy subprocess).
+      # The deeper readiness check is /ready (used by clients, not Docker).
+      # start_period bumped to 120s to give ChromaDB's first-time ONNX model
+      # download room to complete without Docker killing the container.
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
-      start_period: 45s
+      start_period: 120s
 
     deploy:
       resources:

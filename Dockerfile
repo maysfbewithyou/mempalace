@@ -80,7 +80,10 @@ EXPOSE 8000
 
 # Coolify and external monitors hit /health. /health is unauthenticated
 # (architecture A6) and returns "ok" / 503 based on subprocess liveness.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+# /health is a lightweight liveness check (returns ok if wrapper process is alive).
+# start_period=120s gives ChromaDB's first-boot ONNX model download room to finish
+# without Docker killing the container in a tight restart loop.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD curl -fsS http://localhost:8000/health || exit 1
 
 # Single-worker uvicorn — A4. Multiple workers would each spawn a separate

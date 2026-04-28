@@ -352,7 +352,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         self._expected = expected_token.encode("utf-8")
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/health":
+        # /health and /ready are exempt — they're status probes, not data access.
+        if request.url.path in ("/health", "/ready"):
             return await call_next(request)
 
         header = request.headers.get("authorization", "")
@@ -367,9 +368,28 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 # ── Route handlers ───────────────────────────────────────────────────────────
 async def health(request: Request) -> Response:
+    """Lightweight liveness check for Docker / monitoring.
+
+    Returns 200/ok if the wrapper process is alive — does NOT round-trip to
+    the StdioProxy subprocess. Reason: ChromaDB's first-time ONNX model load
+    can take 30+ seconds; if Docker's healthcheck depended on the subprocess
+    being responsive, the container would be killed mid-init in a tight loop.
+    Use /ready for the deeper readiness check (round-trips to the subprocess).
+    """
+    return PlainTextResponse("ok")
+
+
+async def ready(request: Request) -> Response:
+    """Deep readiness check — round-trips to the StdioProxy subprocess.
+
+    Use this from clients that want to know whether the upstream MCP is
+    actually responsive (not just whether the wrapper is alive). NOT used
+    by Docker's HEALTHCHECK because of the ONNX startup latency described
+    in `health`.
+    """
     proxy = _get_proxy()
     if await proxy.healthcheck():
-        return PlainTextResponse("ok")
+        return PlainTextResponse("ready")
     return PlainTextResponse("subprocess unhealthy", status_code=503)
 
 
@@ -462,6 +482,7 @@ def create_app(bearer_token: str | None = None) -> Starlette:
         debug=False,
         routes=[
             Route("/health", health, methods=["GET"]),
+            Route("/ready", ready, methods=["GET"]),
             Route("/mcp", mcp, methods=["POST"]),
         ],
         middleware=[Middleware(BearerAuthMiddleware, expected_token=token)],
