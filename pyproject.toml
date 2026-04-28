@@ -43,9 +43,14 @@ mempalace = "mempalace:main"
 # sync-friendly. Existing 85 tests are unaffected.
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4.0", "psutil>=5.9", "httpx>=0.27"]
 spellcheck = ["autocorrect>=2.0"]
-# IEP fork: HTTP wrapper deps (Phase 2a). Install with: pip install -e ".[http]"
+# IEP fork: HTTP wrapper deps (Phase 2a + Phase 10 OAuth).
+# Install with: pip install -e ".[http]"
 # In Docker the [http] extra is installed alongside the package.
-http = ["starlette>=0.40,<1.0", "uvicorn[standard]>=0.30,<1.0"]
+http = [
+    "starlette>=0.40,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    "pyjwt>=2.8,<3",
+]
 
 [dependency-groups]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4.0", "psutil>=5.9", "httpx>=0.27"]

@@ -232,6 +232,45 @@ def test_mcp_accepts_valid_bearer(app_with_fake, fake_proxy):
     assert fake_proxy.calls[0]["method"] == "tools/list"
 
 
+def test_mcp_accepts_oauth_jwt(app_with_fake, fake_proxy, monkeypatch):
+    """Phase 10: OAuth-issued JWT should authenticate just like static bearer.
+
+    Confirms BearerAuthMiddleware's path 2 (JWT verification via mempalace.oauth)
+    is wired and accepts a freshly-issued token from oauth.issue_jwt().
+    """
+    pytest.importorskip("jwt")
+    monkeypatch.setenv("MEMPALACE_OAUTH_CLIENT_ID", "test-client-id-1234567890aaaa")
+    monkeypatch.setenv("MEMPALACE_OAUTH_CLIENT_SECRET", "test-client-secret-1234567890aaaa")
+    monkeypatch.setenv("MEMPALACE_OAUTH_JWT_SECRET", "x" * 64)
+    monkeypatch.setenv("MEMPALACE_OAUTH_ISSUER", "https://test.example/")
+
+    from mempalace import oauth as _oauth
+
+    jwt_token, _ttl = _oauth.issue_jwt("test-client-id-1234567890aaaa")
+    r = app_with_fake.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 99, "method": "tools/list"},
+        headers={"Authorization": f"Bearer {jwt_token}"},
+    )
+    assert r.status_code == 200
+    assert r.json()["id"] == 99
+
+
+def test_mcp_emits_www_authenticate_on_unauth(app_with_fake):
+    """401 responses must include WWW-Authenticate pointing at the protected-resource
+    metadata, per the MCP OAuth spec — that's how Anthropic's connector backend
+    discovers our authorization server."""
+    r = app_with_fake.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert r.status_code == 401
+    www_auth = r.headers.get("www-authenticate", "")
+    assert "Bearer" in www_auth
+    assert "resource_metadata=" in www_auth
+    assert "/.well-known/oauth-protected-resource" in www_auth
+
+
 # ── Body validation ───────────────────────────────────────────────────────────
 
 

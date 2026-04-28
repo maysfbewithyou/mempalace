@@ -27,13 +27,21 @@ services:
     restart: unless-stopped
 
     # ── Auth and config ────────────────────────────────────────────────
-    # Using the array form (with no value for MEMPALACE_BEARER_TOKEN) so
-    # Coolify's runtime env injection fills it in. The map form
-    # `MEMPALACE_BEARER_TOKEN: ${MEMPALACE_BEARER_TOKEN}` substitutes from
+    # Using the array form (no value) so Coolify's runtime env injection
+    # fills the secrets in. The map form `KEY: ${KEY}` substitutes from
     # the compose shell BEFORE Coolify can inject, which silently resolves
     # to empty and crashes the wrapper at startup.
+    #
+    # Required runtime secrets (set in Coolify Environment Variables UI):
+    #   MEMPALACE_BEARER_TOKEN       — static bearer (laptop CLI diagnostics)
+    #   MEMPALACE_OAUTH_CLIENT_ID    — Phase 10: client_credentials grant
+    #   MEMPALACE_OAUTH_CLIENT_SECRET — Phase 10
+    #   MEMPALACE_OAUTH_JWT_SECRET   — Phase 10: HS256 signing key (>=32 chars)
     environment:
       - MEMPALACE_BEARER_TOKEN
+      - MEMPALACE_OAUTH_CLIENT_ID
+      - MEMPALACE_OAUTH_CLIENT_SECRET
+      - MEMPALACE_OAUTH_JWT_SECRET
       - MEMPAL_PALACE_PATH=/data/.mempalace/palace
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO

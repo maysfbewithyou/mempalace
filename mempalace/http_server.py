@@ -341,29 +341,73 @@ def _get_proxy() -> StdioProxy:
 
 # ── Auth middleware ──────────────────────────────────────────────────────────
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Reject any request to /mcp without a valid `Authorization: Bearer …` header.
+    """Reject any request to /mcp without a valid bearer credential.
 
-    /health is exempt (A6).
-    Constant-time compare via `secrets.compare_digest` to avoid timing leaks.
+    Accepts EITHER:
+      - The static MEMPALACE_BEARER_TOKEN (for laptop CLI testing / curl diagnostics)
+      - An OAuth-issued JWT verified by mempalace.oauth.verify_jwt()
+        (for Anthropic Connectors / Cowork / Claude Desktop / claude.ai web+mobile)
+
+    Public paths exempt from auth:
+      - /health, /ready                                   (status probes, A6)
+      - /oauth/token                                      (OAuth credentials live here)
+      - /.well-known/oauth-authorization-server            (RFC 8414 metadata)
+      - /.well-known/oauth-protected-resource              (RFC 9728 metadata)
+
+    On 401 we emit a WWW-Authenticate header pointing at the protected-resource
+    metadata, per the MCP OAuth spec — this is how Anthropic's connector backend
+    discovers our authorization server.
     """
+
+    PUBLIC_PATHS = (
+        "/health",
+        "/ready",
+        "/oauth/token",
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/oauth-protected-resource",
+    )
 
     def __init__(self, app, expected_token: str) -> None:
         super().__init__(app)
         self._expected = expected_token.encode("utf-8")
 
     async def dispatch(self, request: Request, call_next):
-        # /health and /ready are exempt — they're status probes, not data access.
-        if request.url.path in ("/health", "/ready"):
+        if request.url.path in self.PUBLIC_PATHS:
             return await call_next(request)
 
         header = request.headers.get("authorization", "")
         if not header.startswith("Bearer "):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        token = header.removeprefix("Bearer ").strip().encode("utf-8")
-        if not secrets.compare_digest(token, self._expected):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
+            return self._unauth_response(request)
 
-        return await call_next(request)
+        token_str = header.removeprefix("Bearer ").strip()
+        token_bytes = token_str.encode("utf-8")
+
+        # Path 1: static bearer (laptop CLI / diagnostics).
+        if secrets.compare_digest(token_bytes, self._expected):
+            return await call_next(request)
+
+        # Path 2: OAuth-issued JWT (Anthropic Connectors / Cowork / claude.ai).
+        # Lazy-imported so module import doesn't require pyjwt unless OAuth is exercised.
+        try:
+            from . import oauth as _oauth
+            if _oauth.verify_jwt(token_str):
+                return await call_next(request)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("auth: oauth verify path errored: %s", exc)
+
+        return self._unauth_response(request)
+
+    def _unauth_response(self, request: Request) -> Response:
+        """401 with WWW-Authenticate pointing at our protected-resource metadata."""
+        scheme_url = f"{request.url.scheme}://{request.url.netloc}"
+        www_auth = (
+            f'Bearer resource_metadata="{scheme_url}/.well-known/oauth-protected-resource"'
+        )
+        return JSONResponse(
+            {"error": "unauthorized"},
+            status_code=401,
+            headers={"WWW-Authenticate": www_auth},
+        )
 
 
 # ── Route handlers ───────────────────────────────────────────────────────────
@@ -478,11 +522,31 @@ async def lifespan(app: Starlette):
 def create_app(bearer_token: str | None = None) -> Starlette:
     """Build the Starlette app. Token override is for tests."""
     token = bearer_token if bearer_token is not None else _get_bearer_token()
+
+    # Lazy-import oauth so create_app callers without pyjwt installed (e.g.,
+    # narrow unit tests that only exercise /health) don't pay the import cost.
+    from . import oauth as _oauth
+
     return Starlette(
         debug=False,
         routes=[
+            # Status probes (no auth)
             Route("/health", health, methods=["GET"]),
             Route("/ready", ready, methods=["GET"]),
+            # OAuth 2.0/2.1 endpoints (no auth on the endpoints themselves —
+            # /oauth/token validates client credentials in its body)
+            Route("/oauth/token", _oauth.token_endpoint, methods=["POST"]),
+            Route(
+                "/.well-known/oauth-authorization-server",
+                _oauth.authorization_server_metadata,
+                methods=["GET"],
+            ),
+            Route(
+                "/.well-known/oauth-protected-resource",
+                _oauth.protected_resource_metadata,
+                methods=["GET"],
+            ),
+            # Bearer-protected MCP (accepts static bearer OR OAuth-issued JWT)
             Route("/mcp", mcp, methods=["POST"]),
         ],
         middleware=[Middleware(BearerAuthMiddleware, expected_token=token)],
