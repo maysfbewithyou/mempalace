@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """remote_mine.py — Mine local files into a hosted MemPalace via /mcp.
 
-version: 0.1
-phase: 4
+version: 0.2
+phase: 4 (+ 4a-recovery)
 
 Walks a local directory, reads each text file, and files one drawer per file
 through the hosted MemPalace MCP server's mempalace_add_drawer tool.
@@ -15,13 +15,14 @@ Usage:
       --base-url https://claude-brain.tstly.dev \\
       --wing wing_atlas \\
       --dir "C:/Users/phatt/Documents/GitHub/atlas" \\
-      [--limit 5] [--dry-run] [--include-ext .md,.txt]
+      [--limit 5] [--dry-run] [--include-ext .md,.txt] \\
+      [--check-duplicate] [--rps 0.7]
 
 Routing:
   - --wing is required (one of: wing_mega, wing_iep, wing_atlas, wing_personal).
   - room is derived per file: parent folder name slugified (lowercase, hyphens).
   - source_file is recorded as a relative path from --dir.
-  - agent is hardcoded "remote_miner".
+  - added_by is hardcoded "remote_miner".
 
 Skips:
   - Binary files (detected via null bytes in first 8KB).
@@ -30,9 +31,27 @@ Skips:
     __pycache__, .pytest_cache, *.pyc, *.pyo, *.so, *.dylib).
 
 Idempotency:
-  This v0.1 does NOT call mempalace_check_duplicate before adding. Re-mining
-  the same directory will create duplicate drawers. Use --dry-run first to
-  preview. A future v0.2 may add hash-based dedup.
+  Upstream mempalace_add_drawer documents that it "checks for duplicates first".
+  Re-running the miner over the same tree is therefore safe — the server-side
+  dedup will collapse identical content. The miner does NOT call
+  mempalace_check_duplicate by default because doing so doubles the request
+  count (each file = 1 check + 1 add) for no correctness gain.
+
+  Pass --check-duplicate to opt into client-side dedup. When set, the miner
+  calls mempalace_check_duplicate first, skips the add if a dupe is found, and
+  reports a separate "skipped (dupe)" count. Useful for a recovery run where
+  you want visibility into what was already there vs. what was newly filed.
+
+Throttling:
+  Upstream's RateLimiter is 60 req/min hard-coded. Default --rps 0.7 (= 42/min)
+  leaves comfortable headroom; v0.1 used 0.9 (= 54/min) which produced a few
+  rate-limit errors in tight clusters during Phase 5. With --check-duplicate
+  the effective server load is 2× requests, so consider --rps 0.4.
+
+Changelog:
+  0.2 (2026-04-29): default --rps 0.7 (was 0.9). Optional --check-duplicate
+                    flag. Updated docstrings and UA. Recovers Phase 4a/5 gaps.
+  0.1 (2026-04-27): Initial Phase 4 miner with bearer auth + Cloudflare-safe UA.
 """
 
 from __future__ import annotations
@@ -64,8 +83,8 @@ DEFAULT_SKIP_EXT = {
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico", ".svg",
     ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".wav", ".flac",
     ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z",
-    ".pdf",  # PDFs need extraction; not handled in v0.1
-    ".docx", ".xlsx", ".pptx",  # Office formats; not handled in v0.1
+    ".pdf",  # PDFs need extraction; not handled in v0.x
+    ".docx", ".xlsx", ".pptx",  # Office formats; not handled in v0.x
 }
 
 MAX_DRAWER_BYTES = 100_000  # 100 KB hard cap per drawer (matches upstream limit)
@@ -105,7 +124,7 @@ class MCPClient:
                 # Cloudflare blocks Python-urllib/* UA with error 1010 (banned
                 # browser signature). Use a Mozilla-compatible UA so requests
                 # reach the origin.
-                "User-Agent": "mempalace-remote-miner/0.1 "
+                "User-Agent": "mempalace-remote-miner/0.2 "
                               "(Mozilla/5.0; +https://github.com/maysfbewithyou/mempalace)",
             },
         )
@@ -125,6 +144,27 @@ class MCPClient:
             err = parsed["error"]
             raise RuntimeError(f"MCP error from {name}: {err.get('message', err)}")
         return parsed.get("result", {})
+
+
+def _is_duplicate_response(result: dict) -> bool:
+    """Inspect a mempalace_check_duplicate result and return True if a dupe was found.
+
+    The upstream tool returns a JSON-encoded text block in result.content[0].text
+    with shape like {"is_duplicate": true, "matches": [...]} or
+    {"duplicate": true, ...}. Be lenient about exact field names.
+    """
+    try:
+        text = result.get("content", [{}])[0].get("text", "")
+        inner = json.loads(text) if text else {}
+    except Exception:
+        return False
+    for key in ("is_duplicate", "duplicate", "found", "exists"):
+        if isinstance(inner.get(key), bool) and inner[key]:
+            return True
+    matches = inner.get("matches") or inner.get("duplicates") or []
+    if isinstance(matches, list) and len(matches) > 0:
+        return True
+    return False
 
 
 # ── File handling ─────────────────────────────────────────────────────────────
@@ -205,8 +245,16 @@ def main(argv=None) -> int:
                    help="Additional directory names to skip (repeatable)")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Print every file decision")
-    p.add_argument("--rps", type=float, default=0.9,
-                   help="Max requests per second (default 0.9 — stays under upstream's 60/min limit)")
+    p.add_argument("--rps", type=float, default=0.7,
+                   help="Max requests per second (default 0.7 — comfortable headroom under "
+                        "upstream's 60/min limit; consider 0.4 with --check-duplicate)")
+    p.add_argument("--check-duplicate", action="store_true",
+                   help="Call mempalace_check_duplicate before each add and skip dupes "
+                        "client-side. Doubles request count but gives visibility into what "
+                        "was already in the palace. Off by default — upstream add_drawer "
+                        "already dedupes server-side.")
+    p.add_argument("--dupe-threshold", type=float, default=0.9,
+                   help="Similarity threshold for --check-duplicate (default 0.9)")
     args = p.parse_args(argv)
 
     # Resolve auth
@@ -252,13 +300,19 @@ def main(argv=None) -> int:
             return 3
 
     # Walk + mine
-    print(f"\nWalking {source_dir} (wing={args.wing}, dry_run={args.dry_run})...")
+    print(f"\nWalking {source_dir} (wing={args.wing}, dry_run={args.dry_run}, "
+          f"check_duplicate={args.check_duplicate}, rps={args.rps})...")
     n_filed = 0
     n_skipped_binary = 0
     n_skipped_ext = 0
+    n_skipped_dupe = 0
     n_truncated = 0
     n_errors = 0
     started = time.time()
+
+    # We pace based on n_calls (every server round-trip) rather than n_filed,
+    # so --check-duplicate's extra calls are throttled correctly.
+    n_calls = 0
 
     for path in _walk_files(source_dir, skip_dirs, skip_ext, include_ext):
         rel = path.relative_to(source_dir)
@@ -290,21 +344,46 @@ def main(argv=None) -> int:
                   f"({len(content)} chars{' truncated' if truncated else ''})")
             n_filed += 1
         else:
-            # Rate-limit throttle. Upstream's RateLimiter is 60 req/min hardcoded.
-            # We aim for --rps below 1.0 to stay safely under.
-            if args.rps and args.rps > 0:
-                min_interval = 1.0 / args.rps
-                elapsed_since_start = time.time() - started
-                expected = n_filed * min_interval
-                if elapsed_since_start < expected:
-                    time.sleep(expected - elapsed_since_start)
+            def _throttle():
+                """Rate-limit throttle keyed on total server calls."""
+                if args.rps and args.rps > 0:
+                    min_interval = 1.0 / args.rps
+                    elapsed_since_start = time.time() - started
+                    expected = n_calls * min_interval
+                    if elapsed_since_start < expected:
+                        time.sleep(expected - elapsed_since_start)
 
+            # Optional client-side dedup pre-check
+            if args.check_duplicate:
+                _throttle()
+                n_calls += 1
+                try:
+                    dup = client.call_tool("mempalace_check_duplicate", {
+                        "content": content,
+                        "threshold": args.dupe_threshold,
+                    })
+                    if _is_duplicate_response(dup):
+                        n_skipped_dupe += 1
+                        if args.verbose:
+                            print(f"  SKIP dupe: {rel}")
+                        if args.limit and n_filed >= args.limit:
+                            print(f"  hit --limit {args.limit}, stopping")
+                            break
+                        continue
+                except Exception as exc:
+                    # Non-fatal — log and proceed with the add.
+                    if args.verbose:
+                        print(f"  (check_duplicate failed for {rel}: {exc})")
+
+            _throttle()
+            n_calls += 1
             try:
                 client.call_tool("mempalace_add_drawer", {
                     "wing": args.wing,
                     "room": room,
                     "content": content,
                     "source_file": str(rel),
+                    "added_by": "remote_miner",
                 })
                 if args.verbose:
                     print(f"  filed: {rel} -> {args.wing}/{room}")
@@ -328,6 +407,7 @@ def main(argv=None) -> int:
     print(f"  filed:           {n_filed}")
     print(f"  skipped (binary): {n_skipped_binary}")
     print(f"  skipped (ext):    {n_skipped_ext}")
+    print(f"  skipped (dupe):   {n_skipped_dupe}")
     print(f"  truncated:       {n_truncated}")
     print(f"  errors:          {n_errors}")
 
