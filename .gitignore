@@ -6,3 +6,19 @@ __pycache__/
 .pytest_cache/
 mempal.yaml
 .a5c/
+
+# IEP fork — closeout v3.0.14-iep-hardened (2026-04-29)
+# Project-scoped Claude Code hooks (per D7 — user-local, not committed)
+.claude/
+
+# Phase 4 mining staging artifacts (corpus extracted from Claude.ai export, not source)
+_phase4_*
+_phase4_v010_full/
+_phase4_v010_slice/
+_phase4_zip_report.txt
+
+# Local pytest scratch
+pytest-cache-files-*/
+
+# Hook diagnostic log
+mempalace-hook.log
