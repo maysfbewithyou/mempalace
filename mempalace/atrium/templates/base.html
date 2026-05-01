@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en" data-color-mode="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Atrium{% endblock %} - MemPalace</title>
+  <link rel="stylesheet" href="/atrium/static/app.css">
+
+  <!-- HTMX 2.x CDN-pinned per PRD §3.2; required for live-update + form interactions. -->
+  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js"
+          integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+          crossorigin="anonymous"></script>
+
+  <!-- Inline 30-line keymap per PRD §7 - no JS library. -->
+  <script>
+    document.addEventListener('keydown', (e) => {
+      if (e.target.matches('input,textarea,select')) return;
+      if (e.key === '/') {
+        const search = document.querySelector('input[name="q"]');
+        if (search) { e.preventDefault(); search.focus(); }
+      }
+      if (e.key === '?') { document.getElementById('help-overlay')?.classList.toggle('hidden'); }
+      if (e.key === 'g') {
+        const t = setTimeout(() => document.removeEventListener('keydown', second), 1500);
+        function second(ev) {
+          clearTimeout(t);
+          document.removeEventListener('keydown', second);
+          if (ev.key === 'h') location.href = '/atrium/';
+          else if (ev.key === 'l') location.href = '/atrium/library';
+          else if (ev.key === 'a') location.href = '/atrium/agents';
+          else if (ev.key === 's') location.href = '/atrium/settings';
+        }
+        document.addEventListener('keydown', second);
+      }
+    });
+  </script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-brand">
+        <span class="brand-mark">▣</span>
+        <span class="brand-text">Atrium</span>
+        <span class="brand-version">v{{ atrium_version }}</span>
+      </div>
+
+      <nav class="sidebar-nav" aria-label="Primary">
+        <a href="/atrium/" class="nav-item {% if active == 'home' %}active{% endif %}">
+          <span class="nav-icon">⌂</span>
+          <span class="nav-label">Home</span>
+        </a>
+        <a href="/atrium/library" class="nav-item {% if active == 'library' %}active{% endif %}">
+          <span class="nav-icon">▭</span>
+          <span class="nav-label">Library</span>
+        </a>
+        <a href="/atrium/search" class="nav-item {% if active == 'search' %}active{% endif %}">
+          <span class="nav-icon">⌕</span>
+          <span class="nav-label">Search</span>
+        </a>
+        <a href="/atrium/kg" class="nav-item {% if active == 'kg' %}active{% endif %}">
+          <span class="nav-icon">⌘</span>
+          <span class="nav-label">Knowledge Graph</span>
+        </a>
+
+        <div class="nav-section-label">Agents</div>
+        <a href="/atrium/agents" class="nav-item {% if active == 'agents' %}active{% endif %}">
+          <span class="nav-icon">⏵</span>
+          <span class="nav-label">Activity</span>
+        </a>
+        <a href="/atrium/agents/suggestions" class="nav-item {% if active == 'suggestions' %}active{% endif %}">
+          <span class="nav-icon">⚑</span>
+          <span class="nav-label">Suggestions{% if pending_count %}<span class="badge">{{ pending_count }}</span>{% endif %}</span>
+        </a>
+        <a href="/atrium/agents/reviews" class="nav-item {% if active == 'reviews' %}active{% endif %}">
+          <span class="nav-icon">✓</span>
+          <span class="nav-label">Reviews</span>
+        </a>
+
+        <div class="nav-section-label">Workspace</div>
+        <a href="/atrium/settings" class="nav-item {% if active == 'settings' %}active{% endif %}">
+          <span class="nav-icon">⚙</span>
+          <span class="nav-label">Settings</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="operator">
+          <span class="operator-dot"></span>
+          <span class="operator-email">{{ operator_email }}</span>
+        </div>
+        <button class="theme-toggle" onclick="document.documentElement.dataset.colorMode = document.documentElement.dataset.colorMode === 'dark' ? 'light' : 'dark'; localStorage.setItem('atrium-color-mode', document.documentElement.dataset.colorMode);">
+          ◐ Theme
+        </button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="page-header">
+        <h1 class="page-title">{% block page_title %}{% endblock %}</h1>
+        {% block page_actions %}{% endblock %}
+      </header>
+
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+
+  <div id="help-overlay" class="overlay hidden" role="dialog">
+    <div class="overlay-content">
+      <h2>Keyboard shortcuts</h2>
+      <dl>
+        <dt><kbd>/</kbd></dt><dd>Focus search</dd>
+        <dt><kbd>g</kbd> <kbd>h</kbd></dt><dd>Home</dd>
+        <dt><kbd>g</kbd> <kbd>l</kbd></dt><dd>Library</dd>
+        <dt><kbd>g</kbd> <kbd>a</kbd></dt><dd>Agents</dd>
+        <dt><kbd>g</kbd> <kbd>s</kbd></dt><dd>Settings</dd>
+        <dt><kbd>?</kbd></dt><dd>This help</dd>
+      </dl>
+      <button onclick="document.getElementById('help-overlay').classList.add('hidden')">Close</button>
+    </div>
+  </div>
+
+  <script>
+    // Restore color mode preference per UI/UX v1.4 §Color Mode Standards
+    const saved = localStorage.getItem('atrium-color-mode');
+    if (saved) document.documentElement.dataset.colorMode = saved;
+  </script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Drawer {{ drawer_id }}{% endblock %}
+{% block page_title %}Drawer{% endblock %}
+{% block page_actions %}<a href="/atrium/library">← Library</a>{% endblock %}
+{% block content %}
+
+{% if error %}<div class="error-banner">{{ error }}</div>{% endif %}
+
+{% if drawer %}
+  <div class="card" style="margin-bottom: 16px">
+    <div style="font-family: ui-monospace, monospace; font-size: 12px; color: var(--text-muted); margin-bottom: 8px">{{ drawer.id }}</div>
+    <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px">
+      {% if drawer.metadata.wing %}<span class="pill">wing: {{ drawer.metadata.wing }}</span>{% endif %}
+      {% if drawer.metadata.room %}<span class="pill">room: {{ drawer.metadata.room }}</span>{% endif %}
+      {% if drawer.metadata.added_by %}<span class="pill">by: {{ drawer.metadata.added_by }}</span>{% endif %}
+      {% if drawer.metadata.filed_at %}<span class="pill">filed: {{ drawer.metadata.filed_at[:19] }}</span>{% endif %}
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top: 0; font-size: 12px; color: var(--text-muted); text-transform: uppercase">Content</h3>
+    <pre style="white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 13px; line-height: 1.5; margin: 0">{{ drawer.content }}</pre>
+  </div>
+
+  <details style="margin-top: 16px">
+    <summary style="cursor: pointer; font-size: 12px; color: var(--text-muted)">Full metadata</summary>
+    <pre style="background: var(--bg-card); padding: 12px; border-radius: 6px; font-size: 12px; margin-top: 8px">{{ drawer.metadata }}</pre>
+  </details>
+{% endif %}
+
+{% endblock %}

@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Reviews{% endblock %}
+{% block page_title %}Review History{% endblock %}
+{% block page_actions %}
+  <form method="get" action="/atrium/agents/reviews" style="display: flex; gap: 8px">
+    <select name="verdict">
+      <option value="">all verdicts</option>
+      <option value="approve" {% if request.query_params.get('verdict') == 'approve' %}selected{% endif %}>approve</option>
+      <option value="decline" {% if request.query_params.get('verdict') == 'decline' %}selected{% endif %}>decline</option>
+      <option value="request_changes" {% if request.query_params.get('verdict') == 'request_changes' %}selected{% endif %}>request_changes</option>
+    </select>
+    <input type="text" name="agent_name" value="{{ request.query_params.get('agent_name', '') }}" placeholder="agent_name" style="width: 160px">
+    <button type="submit">Filter</button>
+  </form>
+{% endblock %}
+{% block content %}
+
+{% if ledger_banner %}<div class="error-banner">{{ ledger_banner.message }}</div>{% endif %}
+
+{% if reviews %}
+  <table class="feed">
+    <thead><tr>
+      <th>When</th><th>Agent</th><th>Verdict</th><th>Target</th>
+      <th>Confidence</th><th>Action taken</th><th>Rationale</th>
+    </tr></thead>
+    <tbody>
+      {% for r in reviews %}
+        <tr>
+          <td><code style="font-size: 11px">{{ r.created_at[:19] if r.created_at else '—' }}</code></td>
+          <td>
+            <strong>{{ r.agent_run.agent_name if r.agent_run else '?' }}</strong>
+            {% if r.persona %}<br><span class="pill">{{ r.persona.archetype }} / {{ r.persona.label }}</span>{% endif %}
+          </td>
+          <td><span class="pill pill-{{ 'approved' if r.verdict == 'approve' else ('rejected' if r.verdict == 'decline' else 'edited') }}">{{ r.verdict }}</span></td>
+          <td>
+            <span class="pill">{{ r.reviewed_target_kind }}</span><br>
+            <code style="font-size: 11px">{{ r.reviewed_target_id[:32] }}{% if r.reviewed_target_id|length > 32 %}…{% endif %}</code>
+          </td>
+          <td>{% if r.confidence_score is not none %}{{ "%.2f"|format(r.confidence_score) }}{% else %}—{% endif %}</td>
+          <td>{{ r.action_taken or '—' }}</td>
+          <td style="max-width: 320px">{{ r.rationale[:160] }}{% if r.rationale|length > 160 %}…{% endif %}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <div class="empty-state">
+    <div class="empty-state-icon">✓</div>
+    <div>No reviews yet.</div>
+    <div style="font-size: 12px; margin-top: 8px">Reviews appear here whenever a suggestion is approved/rejected/edited.</div>
+  </div>
+{% endif %}
+
+{% endblock %}

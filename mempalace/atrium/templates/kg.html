@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Knowledge Graph{% endblock %}
+{% block page_title %}Knowledge Graph{% endblock %}
+{% block content %}
+
+<div class="info-banner">
+  <strong>v0.1.0 placeholder.</strong> Cytoscape interactive node-link viz is deferred to v0.2.0+ per PRD §6.4.
+  Below is a textual table view of <code>tool_kg_stats</code> + <code>tool_kg_timeline</code>.
+</div>
+
+{% if error %}<div class="error-banner">{{ error }}</div>{% endif %}
+
+<h2 style="font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted)">Stats</h2>
+{% if kg_stats %}
+  <div class="card-grid">
+    {% for k, v in kg_stats.items() %}
+      <div class="card kpi"><div class="kpi-label">{{ k }}</div><div class="kpi-value">{{ v }}</div></div>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty-state"><div>No KG stats available.</div></div>
+{% endif %}
+
+<h2 style="font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-top: 32px">Timeline (recent triples)</h2>
+{% if kg_timeline %}
+  <table class="feed">
+    <thead><tr><th>Subject</th><th>Predicate</th><th>Object</th><th>Valid from</th></tr></thead>
+    <tbody>
+      {% for t in kg_timeline %}
+        <tr>
+          <td><strong>{{ t.subject if t.subject is defined else t[0] }}</strong></td>
+          <td><span class="pill">{{ t.predicate if t.predicate is defined else t[1] }}</span></td>
+          <td>{{ t.object if t.object is defined else t[2] }}</td>
+          <td><code style="font-size: 11px">{{ (t.valid_from if t.valid_from is defined else '')[:19] }}</code></td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <div class="empty-state"><div>No triples yet.</div></div>
+{% endif %}
+
+{% endblock %}

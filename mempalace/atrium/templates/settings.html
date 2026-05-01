@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block page_title %}Settings{% endblock %}
+{% block content %}
+
+<h2 style="font-size: 14px; text-transform: uppercase; color: var(--text-muted)">Identity</h2>
+<div class="card" style="margin-bottom: 24px">
+  <pre style="margin: 0; white-space: pre-wrap; font-size: 13px; line-height: 1.5">{{ identity }}</pre>
+  <div style="font-size: 11px; color: var(--text-muted); margin-top: 8px">
+    Read-only in v0.1.0 per Phase 2 architecture A8. To revise: bump fork version, regenerate, document.
+  </div>
+</div>
+
+<h2 style="font-size: 14px; text-transform: uppercase; color: var(--text-muted)">About</h2>
+<div class="card" style="margin-bottom: 24px">
+  <dl style="display: grid; grid-template-columns: 160px 1fr; gap: 4px 16px; margin: 0; font-size: 13px">
+    <dt style="color: var(--text-muted)">Atrium version</dt><dd><code>{{ about.atrium_version }}</code></dd>
+    <dt style="color: var(--text-muted)">Palace path</dt><dd><code>{{ about.palace_path }}</code></dd>
+    <dt style="color: var(--text-muted)">Operator</dt><dd>{{ operator_email }}</dd>
+  </dl>
+</div>
+
+<h2 style="font-size: 14px; text-transform: uppercase; color: var(--text-muted)">Persona Registry (PRD §13 + Schema §3.4)</h2>
+{% if ledger_banner %}<div class="error-banner">{{ ledger_banner.message }}</div>{% endif %}
+
+<div class="info-banner" style="font-size: 12px">
+  <strong>Hybrid model:</strong> YAML in atlas repo + bootstrap script + this live editor +
+  block-by-default for unregistered agents. Live edits here also need a matching commit
+  to <code>agent_personas.yaml</code> to survive deploys.
+</div>
+
+{% if personas %}
+  <table class="feed" style="margin-bottom: 24px">
+    <thead><tr>
+      <th>agent_name</th><th>Archetype / Label</th><th>Scope</th><th>Tier</th><th>Description</th><th>Status</th><th></th>
+    </tr></thead>
+    <tbody>
+      {% for p in personas %}
+        <tr>
+          <td><code>{{ p.agent_name }}</code></td>
+          <td>
+            <strong>{{ p.persona_archetype }}</strong>
+            {% if p.persona_label %} / {{ p.persona_label }}{% endif %}
+          </td>
+          <td><span class="pill">{{ p.scope }}</span></td>
+          <td><span class="pill pill-{{ p.governance_tier }}">{{ p.governance_tier }}</span></td>
+          <td style="font-size: 12px; color: var(--text-secondary)">{{ (p.persona_description or '')[:80] }}</td>
+          <td>{% if p.retired_at %}<span class="pill" style="color: var(--text-muted)">retired</span>{% else %}<span class="pill pill-approved">active</span>{% endif %}</td>
+          <td>
+            {% if not p.retired_at %}
+              <form method="post" action="/atrium/settings/personas/{{ p.agent_name }}/retire" style="display: inline" onsubmit="return confirm('Retire {{ p.agent_name }}?')">
+                <button type="submit" class="btn-danger" style="font-size: 11px; padding: 2px 8px">Retire</button>
+              </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <div class="empty-state"><div>No personas registered. Run <code>bootstrap_personas.py</code>.</div></div>
+{% endif %}
+
+<details style="margin-top: 16px">
+  <summary style="cursor: pointer; font-weight: 600">＋ Add or update a persona</summary>
+  <form method="post" action="/atrium/settings/personas" class="card" style="margin-top: 12px; max-width: 640px">
+    <div class="form-group">
+      <label class="form-label">agent_name *</label>
+      <input type="text" name="agent_name" required class="form-input" placeholder="e.g. claude-export">
+    </div>
+    <div class="form-group">
+      <label class="form-label">persona_archetype *</label>
+      <input type="text" name="persona_archetype" required class="form-input" placeholder="Cartographer | Scribe | Surveyor | Navigator | Miner | Exporter">
+    </div>
+    <div class="form-group">
+      <label class="form-label">persona_label *</label>
+      <input type="text" name="persona_label" required class="form-input" placeholder="e.g. Magellan">
+    </div>
+    <div class="form-group">
+      <label class="form-label">persona_description</label>
+      <textarea name="persona_description" class="form-textarea" rows="3"></textarea>
+    </div>
+    <div class="form-group">
+      <label class="form-label">scope *</label>
+      <select name="scope" required class="form-select">
+        <option value="atrium">atrium</option>
+        <option value="project-track">project-track</option>
+        <option value="both">both</option>
+        <option value="global">global</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">governance_tier *</label>
+      <select name="governance_tier" required class="form-select">
+        <option value="approval_gated" selected>approval_gated (default - safest)</option>
+        <option value="supervised">supervised (passive review)</option>
+        <option value="auto">auto (no review - DANGEROUS, use sparingly)</option>
+      </select>
+    </div>
+    <button type="submit" class="btn-primary">Save persona</button>
+    <p style="font-size: 11px; color: var(--text-muted); margin-top: 12px">
+      Saving here updates the DB immediately. <strong>Don't forget to also commit
+      a matching block to <code>agent_personas.yaml</code></strong> in the atlas repo
+      so the change survives the next deploy (bootstrap_personas.py would otherwise
+      override / not-include it).
+    </p>
+  </form>
+</details>
+
+{% endblock %}

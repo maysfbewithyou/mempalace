@@ -1,0 +1,52 @@
+{# Single suggestion card. Used by suggestions.html and as HTMX fragment after a verb action. #}
+{% set s = s if s is defined else suggestion %}
+<div class="card" id="suggestion-{{ s.id }}" style="margin-bottom: 12px">
+  <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px">
+    <div>
+      <strong>{{ s.agent_run.agent_name if s.agent_run else '?' }}</strong>
+      {% if s.persona %}
+        <span class="pill">{{ s.persona.archetype }} / {{ s.persona.label }}</span>
+        <span class="pill pill-{{ s.persona.governance_tier }}">{{ s.persona.governance_tier }}</span>
+      {% endif %}
+      <span class="pill">{{ s.surface }}</span>
+      <span class="pill pill-{{ s.state }}">{{ s.state }}</span>
+    </div>
+    <div style="font-size: 11px; color: var(--text-muted); font-family: ui-monospace, monospace">{{ s.created_at[:19] if s.created_at else '' }}</div>
+  </div>
+
+  <div style="margin-bottom: 12px; font-size: 13px">
+    <strong>{{ s.suggestion_type }}</strong> on <span class="pill">{{ s.target_kind }}</span>
+    <code style="font-size: 11px">{{ s.target_id }}</code>
+  </div>
+
+  {% if s.payload %}
+    <details style="margin-bottom: 12px">
+      <summary style="cursor: pointer; font-size: 12px; color: var(--text-muted)">Payload</summary>
+      <pre style="background: var(--bg-primary); padding: 8px; border-radius: 4px; font-size: 11px; margin-top: 4px; max-height: 240px; overflow: auto">{{ s.payload | tojson(indent=2) }}</pre>
+    </details>
+  {% endif %}
+
+  {% if s.state == 'pending' and not resolved %}
+    <div style="display: flex; gap: 8px; flex-wrap: wrap">
+      <form method="post" action="/atrium/agents/suggestions/{{ s.id }}/approve" style="display: inline">
+        <button type="submit" class="btn-primary">✓ Approve</button>
+      </form>
+      <form method="post" action="/atrium/agents/suggestions/{{ s.id }}/reject" style="display: inline-flex; gap: 4px">
+        <input type="text" name="note" placeholder="reason (required)" required style="width: 200px">
+        <button type="submit" class="btn-danger">✗ Reject</button>
+      </form>
+      <details style="display: inline-block">
+        <summary style="cursor: pointer; padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; display: inline-block">✎ Edit</summary>
+        <form method="post" action="/atrium/agents/suggestions/{{ s.id }}/edit" style="margin-top: 8px; display: flex; flex-direction: column; gap: 8px">
+          <textarea name="note" required placeholder="diff summary (required)" rows="3" style="width: 100%; min-width: 320px"></textarea>
+          <button type="submit" class="btn-primary">Save edit + approve</button>
+        </form>
+      </details>
+    </div>
+  {% else %}
+    <div style="font-size: 12px; color: var(--text-muted)">
+      Resolved {{ s.resolved_at[:19] if s.resolved_at else '' }} by <strong>{{ s.resolved_by_user_id or '—' }}</strong>
+      {% if s.note %}<br><em>{{ s.note }}</em>{% endif %}
+    </div>
+  {% endif %}
+</div>

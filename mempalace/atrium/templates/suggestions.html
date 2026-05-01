@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Suggestions{% endblock %}
+{% block page_title %}Suggestions Queue{% endblock %}
+{% block page_actions %}
+  <form method="get" action="/atrium/agents/suggestions" style="display: flex; gap: 8px">
+    <select name="state">
+      <option value="pending" {% if state_filter == 'pending' %}selected{% endif %}>pending</option>
+      <option value="approved" {% if state_filter == 'approved' %}selected{% endif %}>approved</option>
+      <option value="rejected" {% if state_filter == 'rejected' %}selected{% endif %}>rejected</option>
+      <option value="edited" {% if state_filter == 'edited' %}selected{% endif %}>edited</option>
+      <option value="withdrawn" {% if state_filter == 'withdrawn' %}selected{% endif %}>withdrawn</option>
+    </select>
+    <button type="submit">Filter</button>
+  </form>
+{% endblock %}
+{% block content %}
+
+{% if ledger_banner %}<div class="error-banner">{{ ledger_banner.message }}</div>{% endif %}
+
+<div class="info-banner" style="font-size: 13px">
+  <strong>The Pause-Before-Irreversible-Action surface</strong> (AI Agentic Review §2.10).
+  Each verb is one explicit click. Edit-then-approve is two. No batch-approve in v0.1.0.
+</div>
+
+{% if suggestions %}
+  <div id="suggestions-list">
+    {% for s in suggestions %}
+      {% include "_suggestion_row.html" %}
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty-state">
+    <div class="empty-state-icon">⚑</div>
+    <div>No <strong>{{ state_filter }}</strong> suggestions.</div>
+  </div>
+{% endif %}
+
+{% endblock %}

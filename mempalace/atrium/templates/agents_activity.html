@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Agent Activity{% endblock %}
+{% block page_title %}Agent Activity Feed{% endblock %}
+{% block page_actions %}
+  <form method="get" action="/atrium/agents" style="display: flex; gap: 8px">
+    <input type="text" name="agent_name" value="{{ request.query_params.get('agent_name', '') }}" placeholder="filter agent_name" style="width: 160px">
+    <select name="status">
+      <option value="">all statuses</option>
+      <option value="running" {% if request.query_params.get('status') == 'running' %}selected{% endif %}>running</option>
+      <option value="idle" {% if request.query_params.get('status') == 'idle' %}selected{% endif %}>idle</option>
+      <option value="error" {% if request.query_params.get('status') == 'error' %}selected{% endif %}>error</option>
+      <option value="blocked" {% if request.query_params.get('status') == 'blocked' %}selected{% endif %}>blocked</option>
+    </select>
+    <button type="submit">Filter</button>
+  </form>
+{% endblock %}
+{% block content %}
+
+{% if ledger_banner %}<div class="error-banner">{{ ledger_banner.message }}</div>{% endif %}
+
+{% if runs %}
+  <table class="feed" hx-get="/atrium/agents" hx-trigger="every 5s" hx-target="this" hx-swap="outerHTML">
+    <thead><tr>
+      <th>Started</th><th>Agent</th><th>Surface</th><th>Status</th>
+      <th>Input</th><th>Output</th><th>Duration</th>
+    </tr></thead>
+    <tbody>
+      {% for r in runs %}
+        <tr>
+          <td><code style="font-size: 11px">{{ r.started_at[:19] if r.started_at else '—' }}</code></td>
+          <td><strong>{{ r.agent_name }}</strong>{% if r.agent_version %} <span class="pill">{{ r.agent_version[:12] }}</span>{% endif %}</td>
+          <td><span class="pill">{{ r.surface }}</span></td>
+          <td><span class="pill pill-{{ r.status }}">{{ r.status }}</span></td>
+          <td>{{ (r.input_summary or '')[:60] }}</td>
+          <td>{{ (r.output_summary or '')[:60] }}</td>
+          <td>{% if r.ended_at %}done{% else %}<em style="color: var(--accent-blue)">live</em>{% endif %}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p style="margin-top: 12px; color: var(--text-muted); font-size: 12px">Auto-refreshes every 5s (PRD §7).</p>
+{% else %}
+  <div class="empty-state">
+    <div class="empty-state-icon">⏵</div>
+    <div>No agent runs yet.</div>
+    <div style="font-size: 12px; margin-top: 8px">When an agent calls <code>POST /api/agent-ledger/runs</code>, it appears here.</div>
+  </div>
+{% endif %}
+
+{% endblock %}

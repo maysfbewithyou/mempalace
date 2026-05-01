@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Home{% endblock %}
+{% block page_title %}Palace Overview{% endblock %}
+{% block content %}
+
+{% if ledger_banner %}
+  <div class="error-banner">{{ ledger_banner.message }}</div>
+{% endif %}
+
+<div class="card-grid" style="margin-bottom: 24px">
+  <div class="card kpi"><div class="kpi-label">Drawers</div><div class="kpi-value">{{ kpi_drawers }}</div></div>
+  <div class="card kpi"><div class="kpi-label">Wings</div><div class="kpi-value">{{ kpi_wings }}</div></div>
+  <div class="card kpi"><div class="kpi-label">Recent runs</div><div class="kpi-value">{{ recent_runs|length }}</div></div>
+  <div class="card kpi"><div class="kpi-label">Operator</div><div class="kpi-value" style="font-size: 16px">{{ operator_email }}</div></div>
+</div>
+
+<h2 style="font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-top: 32px">Wings</h2>
+{% if wing_breakdown %}
+  <div class="card-grid">
+    {% for wing_name, count in wing_breakdown %}
+      <a href="/atrium/library/{{ wing_name }}" class="card" style="text-decoration: none; color: inherit">
+        <div style="font-weight: 600; font-size: 16px; color: var(--accent-blue)">{{ wing_name }}</div>
+        <div style="color: var(--text-secondary); font-size: 13px; margin-top: 4px">{{ count }} drawer{% if count != 1 %}s{% endif %}</div>
+      </a>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty-state"><div class="empty-state-icon">▭</div><div>No wing data — palace may be empty or unreachable.</div></div>
+{% endif %}
+
+<h2 style="font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-top: 32px">Recent agent activity</h2>
+{% if recent_runs %}
+  <table class="feed">
+    <thead><tr><th>When</th><th>Agent</th><th>Surface</th><th>Status</th><th>Summary</th></tr></thead>
+    <tbody>
+      {% for r in recent_runs %}
+        <tr>
+          <td><code>{{ r.started_at[:19] if r.started_at else '—' }}</code></td>
+          <td><strong>{{ r.agent_name }}</strong>{% if r.agent_version %} <span class="pill">{{ r.agent_version }}</span>{% endif %}</td>
+          <td><span class="pill">{{ r.surface }}</span></td>
+          <td><span class="pill pill-{{ r.status }}">{{ r.status }}</span></td>
+          <td>{{ (r.input_summary or r.output_summary or '')[:80] }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p style="margin-top: 12px"><a href="/atrium/agents">View all activity →</a></p>
+{% else %}
+  <div class="empty-state">
+    <div class="empty-state-icon">⏵</div>
+    <div>No recent runs — the ledger is empty.</div>
+    <div style="font-size: 12px; margin-top: 8px">Agents will appear here once they post to <code>POST /api/agent-ledger/runs</code>.</div>
+  </div>
+{% endif %}
+
+{% endblock %}

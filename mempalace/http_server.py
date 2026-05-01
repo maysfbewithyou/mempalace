@@ -577,6 +577,24 @@ async def lifespan(app: Starlette):
 
 
 # ── Application factory ──────────────────────────────────────────────────────
+# ── Atrium lazy-import helpers (Track B+C of Agent Network build) ───────────
+def _atrium_routes():
+    """Lazy-import to avoid pulling jinja2 when Atrium is disabled."""
+    from .atrium.routes import get_routes
+    return get_routes()
+
+
+def _atrium_static():
+    from .atrium.routes import get_static_mount
+    return get_static_mount()
+
+
+def _AtriumAuthMiddleware(app):
+    """Lazy-resolve the middleware class so import order is safe."""
+    from .atrium.auth import AtriumAuthMiddleware
+    return AtriumAuthMiddleware(app)
+
+
 def create_app(bearer_token: str | None = None) -> Starlette:
     """Build the Starlette app. Token override is for tests."""
     token = bearer_token if bearer_token is not None else _get_bearer_token()

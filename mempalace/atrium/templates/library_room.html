@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}{{ wing }}/{{ room }} — Library{% endblock %}
+{% block page_title %}{{ wing }} / {{ room }}{% endblock %}
+{% block page_actions %}<a href="/atrium/library/{{ wing }}">← {{ wing }}</a>{% endblock %}
+{% block content %}
+
+{% if error %}<div class="error-banner">Could not load drawers: {{ error }}</div>{% endif %}
+
+{% if drawers %}
+  <table class="feed">
+    <thead><tr><th>Filed</th><th>Source</th><th>Added by</th><th>Preview</th></tr></thead>
+    <tbody>
+      {% for d in drawers %}
+        <tr>
+          <td><code style="font-size: 11px">{{ d.filed_at[:19] if d.filed_at else '—' }}</code></td>
+          <td><span class="pill" style="font-size: 11px">{{ d.source_file or '—' }}</span></td>
+          <td>{{ d.added_by or '—' }}</td>
+          <td><a href="/atrium/drawer/{{ d.id }}">{{ d.preview }}</a></td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p style="margin-top: 12px; color: var(--text-muted); font-size: 12px">Showing first {{ drawers|length }} drawers (limit 200).</p>
+{% else %}
+  <div class="empty-state"><div class="empty-state-icon">▭</div><div>No drawers in this room yet — file with <code>mempalace_add_drawer</code>.</div></div>
+{% endif %}
+
+{% endblock %}

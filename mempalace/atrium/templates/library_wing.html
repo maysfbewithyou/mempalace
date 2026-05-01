@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}{{ wing }} — Library{% endblock %}
+{% block page_title %}{{ wing }}{% endblock %}
+{% block page_actions %}<a href="/atrium/library">← Back to wings</a>{% endblock %}
+{% block content %}
+
+{% if error %}<div class="error-banner">Could not load rooms: {{ error }}</div>{% endif %}
+
+{% if rooms %}
+  <table class="feed">
+    <thead><tr><th>Room</th><th>Drawers</th></tr></thead>
+    <tbody>
+      {% for r in rooms %}
+        <tr>
+          <td><a href="/atrium/library/{{ wing }}/{{ r.name }}">{{ r.name }}</a></td>
+          <td>{{ r.drawer_count }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <div class="empty-state"><div class="empty-state-icon">▭</div><div>No rooms in this wing yet.</div></div>
+{% endif %}
+
+{% endblock %}

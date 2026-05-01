@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Search{% endblock %}
+{% block page_title %}Search{% endblock %}
+{% block content %}
+
+<form method="get" action="/atrium/search" style="margin-bottom: 24px; display: flex; gap: 8px">
+  <input type="text" name="q" value="{{ q }}" placeholder="Search the palace…"
+         autofocus style="flex: 1">
+  <input type="text" name="wing" value="{{ wing or '' }}" placeholder="wing (optional)"
+         style="width: 160px">
+  <button type="submit" class="btn-primary">Search</button>
+</form>
+
+{% if error %}<div class="error-banner">{{ error }}</div>{% endif %}
+
+{% if sanitization and sanitization.modified %}
+  <div class="info-banner">
+    Query was sanitized: <code>{{ sanitization.original }}</code> → <code>{{ sanitization.sanitized }}</code>
+    {% if sanitization.notes %}<div style="font-size: 12px; margin-top: 4px">{{ sanitization.notes }}</div>{% endif %}
+  </div>
+{% endif %}
+
+{% if q %}
+  {% if results %}
+    <div style="color: var(--text-muted); margin-bottom: 12px">{{ results|length }} result{% if results|length != 1 %}s{% endif %}</div>
+    <table class="feed">
+      <thead><tr><th>Wing</th><th>Room</th><th>Score</th><th>Snippet</th></tr></thead>
+      <tbody>
+        {% for r in results %}
+          <tr>
+            <td><span class="pill">{{ r.wing }}</span></td>
+            <td>{{ r.room }}</td>
+            <td><code>{{ "%.3f"|format(r.similarity) if r.similarity is number else r.similarity }}</code></td>
+            <td>{{ (r.text or '')[:300] }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <div class="empty-state"><div class="empty-state-icon">⌕</div><div>No results.</div></div>
+  {% endif %}
+{% else %}
+  <div class="empty-state"><div class="empty-state-icon">⌕</div><div>Enter a query to search the palace.</div></div>
+{% endif %}
+
+{% endblock %}

@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Library{% endblock %}
+{% block page_title %}Library — Wings{% endblock %}
+{% block content %}
+
+{% if error %}<div class="error-banner">Could not load wings: {{ error }}</div>{% endif %}
+
+{% if wings %}
+  <div class="card-grid">
+    {% for w in wings %}
+      <a href="/atrium/library/{{ w.name }}" class="card" style="text-decoration: none; color: inherit">
+        <div style="font-weight: 600; font-size: 18px; color: var(--accent-blue)">{{ w.name }}</div>
+        <div style="color: var(--text-secondary); font-size: 13px; margin-top: 4px">
+          {{ w.drawer_count }} drawer{% if w.drawer_count != 1 %}s{% endif %}
+          • {{ w.room_count }} room{% if w.room_count != 1 %}s{% endif %}
+        </div>
+        {% if w.sample_rooms %}
+          <div style="margin-top: 8px; font-size: 12px; color: var(--text-muted)">
+            {% for r in w.sample_rooms %}<span class="pill">{{ r }}</span> {% endfor %}
+            {% if w.room_count > w.sample_rooms|length %}<span style="opacity: 0.5">+{{ w.room_count - w.sample_rooms|length }} more</span>{% endif %}
+          </div>
+        {% endif %}
+      </a>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty-state"><div class="empty-state-icon">▭</div><div>No wings found.</div></div>
+{% endif %}
+
+{% endblock %}
