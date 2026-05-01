@@ -1,16 +1,29 @@
 """OAuth 2.0 / 2.1 provider for the MemPalace HTTP wrapper.
 
-version: 0.2 (added authorization_code+PKCE flow used by Anthropic Connectors)
+version: 0.3 (added refresh_token grant + rotation; access_token TTL unchanged)
 phase: 10
+
+Version history:
+  0.1 — initial client_credentials provider
+  0.2 — added authorization_code+PKCE flow used by Anthropic Connectors
+  0.3 — added refresh_token grant with single-use rotation (rollback to 0.2 by
+        reverting this commit; AS metadata change is backwards-compatible —
+        clients that don't know refresh_token will simply ignore it)
 
 Endpoints:
   GET   /authorize                                — RFC 6749 §4.1.1 authorization request
   POST  /oauth/token                              — RFC 6749 token endpoint
-                                                    (grant types: client_credentials, authorization_code)
+                                                    (grant types: client_credentials,
+                                                     authorization_code, refresh_token)
   GET   /.well-known/oauth-authorization-server   — RFC 8414 AS metadata
   GET   /.well-known/oauth-protected-resource     — RFC 9728 resource metadata
 
-JWTs are HS256 with a server-side secret. Default TTL 1 hour.
+Access tokens are HS256 JWTs with a server-side secret. Default TTL 1 hour.
+Refresh tokens are opaque random strings (not JWTs) — verification requires
+server-side state anyway (for rotation and revocation), so opaque is cleaner.
+Default refresh-token TTL 30 days. Refresh tokens are single-use: each refresh
+mints a NEW refresh token and marks the old one used. Reusing a consumed
+refresh token returns invalid_grant (RFC 6749 §10.4).
 
 Anthropic Connector flow (authorization_code with PKCE):
   1. User adds custom connector at claude.ai with URL=https://claude-brain.tstly.dev/mcp
@@ -44,7 +57,8 @@ Env vars (all required at runtime):
   MEMPALACE_OAUTH_CLIENT_SECRET   — >=16 chars, OAuth client secret
   MEMPALACE_OAUTH_JWT_SECRET      — >=32 chars, HS256 signing key
   MEMPALACE_OAUTH_ISSUER          — optional; defaults to https://claude-brain.tstly.dev
-  MEMPALACE_OAUTH_TOKEN_TTL       — optional; defaults to 3600 (seconds)
+  MEMPALACE_OAUTH_TOKEN_TTL       — optional; defaults to 3600 (access token, seconds)
+  MEMPALACE_OAUTH_REFRESH_TTL     — optional; defaults to 2592000 (refresh token, 30 days)
   MEMPALACE_OAUTH_ALLOWED_REDIRECT — optional; defaults to https://claude.ai/api/mcp/auth_callback
 """
 
@@ -80,6 +94,35 @@ def _gc_expired_codes() -> None:
     expired = [k for k, v in _AUTHZ_CODES.items() if v.get("expires_at", 0) < now or v.get("used")]
     for k in expired:
         _AUTHZ_CODES.pop(k, None)
+
+
+# ── In-memory refresh token store ─────────────────────────────────────────────
+# Same single-process assumption as authz codes (A4 — one uvicorn worker).
+# Each entry: { client_id, scope, resource, expires_at, used }
+# Refresh tokens are SINGLE-USE: a successful refresh marks the old one used
+# and issues a new one. Reusing a consumed refresh token yields invalid_grant
+# per RFC 6749 §10.4 ("The authorization server MUST … invalidate the
+# refresh token, and revoke all access tokens previously issued").
+_REFRESH_TOKENS: dict[str, dict] = {}
+
+
+def _gc_expired_refresh_tokens() -> None:
+    """Drop expired refresh tokens. Called opportunistically.
+
+    NOTE: We deliberately keep USED refresh tokens until their natural expiry,
+    so that reuse of a consumed RT can be DETECTED (returning invalid_grant
+    with a "used" error_description) rather than masquerading as an unknown
+    token. This preserves the RFC 6749 §10.4 compromise-indicator signal.
+    With one user and a 30-day TTL, the dict stays small (a few hundred
+    entries at most).
+    """
+    now = time.time()
+    expired = [
+        k for k, v in _REFRESH_TOKENS.items()
+        if v.get("expires_at", 0) < now
+    ]
+    for k in expired:
+        _REFRESH_TOKENS.pop(k, None)
 
 
 def _allowed_redirect_uri() -> str:
@@ -148,6 +191,18 @@ def _get_token_ttl() -> int:
         return 3600
 
 
+def _get_refresh_token_ttl() -> int:
+    """Default 30 days. Refresh tokens are bearer credentials, but their blast
+    radius is limited by single-use rotation — a stolen RT is detected as soon
+    as the legitimate client tries to use it (causing an invalid_grant), at
+    which point the user can reconnect to revoke the family.
+    """
+    try:
+        return int(os.environ.get("MEMPALACE_OAUTH_REFRESH_TTL", str(30 * 24 * 3600)))
+    except ValueError:
+        return 30 * 24 * 3600
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _decode_basic_auth(header_value: str) -> tuple[Optional[str], Optional[str]]:
@@ -188,6 +243,25 @@ def issue_jwt(client_id: str) -> tuple[str, int]:
     if isinstance(token, bytes):
         token = token.decode("utf-8")
     return token, ttl
+
+
+def issue_refresh_token(client_id: str, scope: str = "mcp", resource: str = "") -> tuple[str, int]:
+    """Mint a new refresh token bound to the given client_id.
+
+    Returns (refresh_token_string, ttl_seconds). The token is opaque (no
+    payload) — its only meaning is as a lookup key into _REFRESH_TOKENS,
+    where the binding to client_id and scope is recorded.
+    """
+    ttl = _get_refresh_token_ttl()
+    rt = secrets.token_urlsafe(48)
+    _REFRESH_TOKENS[rt] = {
+        "client_id": client_id,
+        "scope": scope,
+        "resource": resource,
+        "expires_at": time.time() + ttl,
+        "used": False,
+    }
+    return rt, ttl
 
 
 def verify_jwt(token: str) -> bool:
@@ -430,11 +504,76 @@ async def token_endpoint(request: Request) -> Response:
         entry["used"] = True
 
         token, ttl = issue_jwt(client_id)
+        rt, _rt_ttl = issue_refresh_token(
+            client_id,
+            scope=entry.get("scope", "mcp"),
+            resource=entry.get("resource", ""),
+        )
+        logger.info("oauth: issued access+refresh tokens (grant=authorization_code)")
         return JSONResponse(
             {
                 "access_token": token,
                 "token_type": "Bearer",
                 "expires_in": ttl,
+                "refresh_token": rt,
+                "scope": entry.get("scope", "mcp"),
+            },
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
+    # ── refresh_token grant (RFC 6749 §6, with single-use rotation) ─────
+    if grant_type == "refresh_token":
+        rt = form.get("refresh_token", "")
+        if not rt:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": "refresh_token is required"},
+                status_code=400,
+            )
+
+        _gc_expired_refresh_tokens()
+        entry = _REFRESH_TOKENS.get(rt)
+        if entry is None:
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "Unknown refresh_token"},
+                status_code=400,
+            )
+        if entry.get("used"):
+            # Reuse of a consumed RT — RFC 6749 §10.4 says we SHOULD treat
+            # this as a compromise indicator. For a single-user personal
+            # server we just reject; the user will reconnect, which mints
+            # a fresh AC + RT chain and orphans the entire stolen family.
+            logger.warning("oauth: refresh_token reuse detected — rejecting")
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "refresh_token already used"},
+                status_code=400,
+            )
+        if entry.get("expires_at", 0) < time.time():
+            _REFRESH_TOKENS.pop(rt, None)
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "refresh_token expired"},
+                status_code=400,
+            )
+        if entry.get("client_id") != client_id:
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "refresh_token/client mismatch"},
+                status_code=400,
+            )
+
+        # Rotate: mark old RT used, issue new RT bound to the same client + scope.
+        entry["used"] = True
+        token, ttl = issue_jwt(client_id)
+        new_rt, _rt_ttl = issue_refresh_token(
+            client_id,
+            scope=entry.get("scope", "mcp"),
+            resource=entry.get("resource", ""),
+        )
+        logger.info("oauth: rotated refresh_token (grant=refresh_token)")
+        return JSONResponse(
+            {
+                "access_token": token,
+                "token_type": "Bearer",
+                "expires_in": ttl,
+                "refresh_token": new_rt,
                 "scope": entry.get("scope", "mcp"),
             },
             headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
@@ -444,7 +583,7 @@ async def token_endpoint(request: Request) -> Response:
         {
             "error": "unsupported_grant_type",
             "error_description": (
-                "Only client_credentials and authorization_code are supported"
+                "Only client_credentials, authorization_code, and refresh_token are supported"
             ),
         },
         status_code=400,
@@ -466,7 +605,7 @@ async def authorization_server_metadata(request: Request) -> Response:
             "client_secret_basic",
             "client_secret_post",
         ],
-        "grant_types_supported": ["authorization_code", "client_credentials"],
+        "grant_types_supported": ["authorization_code", "client_credentials", "refresh_token"],
         "response_types_supported": ["code"],
         "code_challenge_methods_supported": ["S256"],
         "scopes_supported": ["mcp"],
