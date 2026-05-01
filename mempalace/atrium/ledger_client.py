@@ -108,7 +108,7 @@ def _do_request(method: str, path: str,
             url += "?" + urllib.parse.urlencode(params)
 
     data_bytes = None
-    req_headers = {"Accept": "application/json"}
+    req_headers = {"Accept": "application/json", "User-Agent": "Atrium/0.1.0 (mempalace-fork; ledger-client)"}
     if body is not None:
         data_bytes = json.dumps(body).encode("utf-8")
         req_headers["Content-Type"] = "application/json"
