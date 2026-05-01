@@ -625,7 +625,12 @@ def create_app(bearer_token: str | None = None) -> Starlette:
             # Bearer-protected MCP (accepts static bearer OR OAuth-issued JWT)
             Route("/mcp", mcp, methods=["POST"]),
         ],
-        middleware=[Middleware(BearerAuthMiddleware, expected_token=token)],
+        middleware=[
+            # AtriumAuthMiddleware MUST run BEFORE BearerAuthMiddleware so /atrium/*
+            # paths are gated on operator email instead of bearer token.
+            Middleware(_AtriumAuthMiddleware),
+            Middleware(BearerAuthMiddleware, expected_token=token),
+        ],
         lifespan=lifespan,
     )
 
