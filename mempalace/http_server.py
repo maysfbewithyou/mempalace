@@ -629,6 +629,10 @@ def create_app(bearer_token: str | None = None) -> Starlette:
             ),
             # Bearer-protected MCP (accepts static bearer OR OAuth-issued JWT)
             Route("/mcp", mcp, methods=["POST"]),
+            # Atrium UI routes (Track B+C of Agent Network build, atrium v0.1.0.x).
+            # Auth handled by AtriumAuthMiddleware (CF Access email or dev bypass).
+            *_atrium_routes(),
+            _atrium_static(),
         ],
         middleware=[
             # AtriumAuthMiddleware MUST run BEFORE BearerAuthMiddleware so /atrium/*
