@@ -589,10 +589,9 @@ def _atrium_static():
     return get_static_mount()
 
 
-def _AtriumAuthMiddleware(app):
-    """Lazy-resolve the middleware class so import order is safe."""
-    from .atrium.auth import AtriumAuthMiddleware
-    return AtriumAuthMiddleware(app)
+# Direct import (was lazy factory in v0.1.0.0; that pattern didn't register
+# correctly with Starlette's Middleware constructor — class required, not factory).
+from .atrium.auth import AtriumAuthMiddleware as _AtriumAuthMiddleware  # noqa: E402
 
 
 def create_app(bearer_token: str | None = None) -> Starlette:
