@@ -414,6 +414,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if request.url.path in self.PUBLIC_PATHS:
             return await call_next(request)
 
+        # Atrium routes are gated by AtriumAuthMiddleware (operator email
+        # via CF Access or dev-bypass token). Bearer-token check does NOT apply.
+        if request.url.path == "/atrium" or request.url.path.startswith("/atrium/"):
+            return await call_next(request)
+
         header = request.headers.get("authorization", "")
         if not header.startswith("Bearer "):
             return self._unauth_response(request)
