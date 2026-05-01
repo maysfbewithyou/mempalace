@@ -1,0 +1,81 @@
+# Atrium dev sandbox — Coolify deploy of mempalace-fork's atrium routes
+# Version: v1.0 (atrium v0.1.0.0..v0.1.0.4 — Track B+C of Agent Network build)
+# Feature branch: feature/atrium-v0.1.0
+# Subdomain: atrium-dev.tstly.dev (host port 5044 via atlas-dev tunnel)
+# Purpose: prove the Atrium UI renders + ledger client roundtrips against
+# agent-ledger-dev.tstly.dev WITHOUT touching the production claude-brain palace.
+#
+# Differences from docker-compose.coolify.yml (the production claude-brain compose):
+#   - Different container name (atrium_mempalace_matt)
+#   - Different host port (5044, not 5042)
+#   - Different named volume (atrium_palace_data, not mempalace_data)
+#   - Adds Atrium-specific env vars (ATRIUM_DEV_BYPASS_TOKEN, ATLAS_*)
+#   - Empty palace on first boot — first-boot bootstrap will set up the wings
+#     identical to claude-brain but the data starts fresh
+
+services:
+  atrium-mempalace:
+    container_name: atrium_mempalace_matt
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mempalace-iep-atrium:0.1
+    restart: unless-stopped
+
+    environment:
+      # MemPalace HTTP wrapper auth (existing pattern - same secret types as
+      # the production claude-brain Coolify project, just different values).
+      - MEMPALACE_BEARER_TOKEN
+      - MEMPALACE_OAUTH_CLIENT_ID
+      - MEMPALACE_OAUTH_CLIENT_SECRET
+      - MEMPALACE_OAUTH_JWT_SECRET
+      - MEMPAL_PALACE_PATH=/data/.mempalace/palace
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
+      - FLASK_ENV=development
+
+      # ── Atrium UI auth (atrium v0.1.0.0+) ────────────────────────────
+      # Dev-only bypass for browser sessions. Pass X-Atrium-Dev-Token
+      # header matching this value to authenticate as matt@interactep.com.
+      # Production (post-B1): leave UNSET; Atrium will gate on
+      # Cf-Access-Authenticated-User-Email instead.
+      - ATRIUM_DEV_BYPASS_TOKEN
+      - ATRIUM_OPERATOR_EMAILS=matt@interactep.com,luke@interactep.com
+
+      # ── Atrium → Atlas ledger client (atrium v0.1.0.2+) ──────────────
+      # Either of these env vars works; ATLAS_DEV_BYPASS_TOKEN is the dev
+      # path. Production: ATLAS_BOOTSTRAP_TOKEN with a CF Access service-auth
+      # token (post-B1).
+      - ATLAS_BOOTSTRAP_TOKEN
+      - ATLAS_DEV_BYPASS_TOKEN
+      - ATLAS_LEDGER_BASE_URL=https://agent-ledger-dev.tstly.dev
+      - ATLAS_LEDGER_TIMEOUT_SECONDS=5
+
+    ports:
+      - "5044:8000"
+
+    volumes:
+      - atrium_palace_data:/data
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "10"
+
+volumes:
+  atrium_palace_data:
+    name: atrium_palace_data
