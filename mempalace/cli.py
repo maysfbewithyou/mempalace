@@ -503,6 +503,45 @@ def main():
     # status
     sub.add_parser("status", help="Show what's been filed")
 
+    # kg-backfill (IEP fork: bulk-extract triples from existing drawers)
+    p_kg = sub.add_parser(
+        "kg-backfill",
+        help="Extract KG triples from existing drawers (one-time backfill / incremental top-up)",
+    )
+    p_kg.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Count drawers and estimate cost without calling the extractor",
+    )
+    p_kg.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Process at most this many drawers (0 = all)",
+    )
+    p_kg.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt before incurring API cost",
+    )
+    p_kg.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print kg_extract_log totals + recent anomalies, no extraction",
+    )
+    p_kg.add_argument(
+        "--stats-source",
+        default=None,
+        choices=["tool_add_drawer", "kg-backfill", "manual"],
+        help="With --stats: filter by source",
+    )
+    p_kg.add_argument(
+        "--stats-window-days",
+        type=int,
+        default=None,
+        help="With --stats: only include the last N days",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -535,8 +574,27 @@ def main():
         "wake-up": cmd_wakeup,
         "repair": cmd_repair,
         "status": cmd_status,
+        "kg-backfill": cmd_kg_backfill,
     }
     dispatch[args.command](args)
+
+
+def cmd_kg_backfill(args):
+    """Run KG backfill or print log stats. Defers heavy imports to runtime."""
+    from .kg_backfill import run_backfill, print_stats
+
+    if args.stats:
+        print_stats(source=args.stats_source, window_days=args.stats_window_days)
+        return
+
+    summary = run_backfill(
+        palace_path=args.palace,
+        dry_run=args.dry_run,
+        limit=args.limit,
+        yes=args.yes,
+    )
+    if summary.get("aborted"):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

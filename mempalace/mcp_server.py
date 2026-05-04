@@ -513,7 +513,56 @@ def tool_add_drawer(
             ],
         )
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
-        return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+
+        # ── KG auto-extract (v0.4: post-add hook, flag-gated) ────────────
+        # When MEMPALACE_KG_AUTO_EXTRACT=true, send the drawer content to the
+        # extractor and write the resulting triples to the KG. Wrapped so that
+        # ANY extraction failure is logged but NEVER fails the drawer write —
+        # a successful add_drawer must remain successful even if extraction
+        # crashes the API client, hits an anomaly, or emits malformed output.
+        triples_written = 0
+        if os.environ.get("MEMPALACE_KG_AUTO_EXTRACT", "").lower() == "true":
+            try:
+                from .kg_extractor import extract_triples
+
+                triples = extract_triples(
+                    content,
+                    source="tool_add_drawer",
+                    drawer_id=drawer_id,
+                )
+                for t in triples:
+                    try:
+                        if t.subject_type:
+                            _kg.add_entity(t.subject, entity_type=t.subject_type)
+                        if t.object_type:
+                            _kg.add_entity(t.object, entity_type=t.object_type)
+                        _kg.add_triple(
+                            subject=t.subject,
+                            predicate=t.predicate,
+                            obj=t.object,
+                            valid_from=t.valid_from,
+                            valid_to=t.valid_to,
+                            confidence=t.confidence,
+                            source_file=f"drawer:{drawer_id}",
+                        )
+                        triples_written += 1
+                    except Exception:
+                        logger.exception(
+                            "kg_auto_extract: failed to persist triple %r → %r → %r",
+                            t.subject, t.predicate, t.object,
+                        )
+                if triples_written:
+                    logger.info(
+                        "kg_auto_extract: wrote %d triple(s) for drawer %s",
+                        triples_written, drawer_id,
+                    )
+            except Exception:
+                logger.exception("kg_auto_extract: top-level failure (drawer write OK)")
+
+        result = {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+        if triples_written:
+            result["triples_extracted"] = triples_written
+        return result
     except Exception as e:
         logger.error(f"Add drawer error ({wing}/{room}): {e}")
         return {"success": False, "error": "Failed to file drawer"}

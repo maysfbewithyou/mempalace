@@ -357,3 +357,112 @@ File "/venv/lib/python3.12/site-packages/mempalace/http_server.py", line 297, in
   3. Tail server logs while exercising search. With v0.3 you should see no `LimitOverrunError` mentions in normal operation. If one does appear (>10 MiB single response), it's now a clearly logged and recovered-from event rather than a session-corrupting crash.
 
 **Rollback:** Revert this commit. If deployed, search fails again on any response > 64 KiB — but no other tools regress.
+
+---
+
+## Version 6.0 — KG Auto-Extract Foundation (2026-05-04)
+
+The KG layer (KnowledgeGraph class, sqlite, temporal validity, queries) has shipped since day one but never had an automatic population path — every drawer added via `mempalace_add_drawer` went into ChromaDB and nowhere else, leaving the KG dormant with 0 entities and 0 triples. v6.0 wires the missing connection: every drawer can now flow through an Anthropic-API-backed extractor that emits `(subject, predicate, object)` triples bound to a v0.1 vocabulary, with structured cost telemetry and anomaly detection.
+
+This release adds the foundation but does NOT change any default runtime behavior — auto-extraction is gated behind `MEMPALACE_KG_AUTO_EXTRACT=true` (default `false`), and the bulk-backfill is opt-in via the new CLI subcommand. Deploying v6.0 is a no-op until the operator flips the flag.
+
+Module versions: NEW `mempalace/kg_extractor.py` v0.1, NEW `mempalace/kg_extract_log.py` v0.1, NEW `mempalace/kg_backfill.py` v0.1, modified `mempalace/mcp_server.py` (post-add hook), `mempalace/cli.py` (kg-backfill subcommand), `pyproject.toml` (added `anthropic>=0.40` to `[http]` extra). All 89 existing-and-new tests pass.
+
+---
+
+### Fix 21: NEW — KG Auto-Extract Module + Vocabulary v0.1
+
+**File:** `mempalace/kg_extractor.py` (NEW — 433 lines)
+
+Pulls structured triples out of drawer content via the Anthropic API (Haiku 4.5 by default — fast, ~$0.0005 per drawer). The module is the single API surface that both `tool_add_drawer` and the bulk-backfill use; it ensures both paths emit triples against the same vocabulary and write to the same telemetry log.
+
+**Vocabulary v0.1** (grounded in samples from the user's actual content — Atlas PRDs, TECHNICAL_CHANGELOGs, AI Governance, deployment session logs, audit baselines, schema docs):
+
+  - **12 entity types:** Person, Organization, Project, Component, Document, Version, Decision, Finding, Event, Technology, Service, Phase.
+  - **25 predicates** grouped: people/orgs (`member_of`, `works_with`, `authored`, `assigned_to`), project structure (`part_of`, `owned_by`, `integrates_with`), versioning (`has_version`, `supersedes`, `tagged_as`, `at_phase`), status (`has_status`, `is_locked`), documents (`documented_in`, `references`, `governed_by`), technical (`depends_on`, `uses`, `runs_on`, `pinned_to`, `deployed_at`), findings/decisions (`identified_in`, `resolved_by`, `blocks`, `decided_at`).
+
+**Flexible-evolving discipline:** the model is told to prefer the known vocabulary but is allowed to coin new predicates when nothing fits, marked with `novel_predicate=true`. The parser cross-checks the model's self-report against `KNOWN_PREDICATES` and overrides in both directions (catches both "model lied about novelty" and "model coined a known predicate"). Every novel predicate logs at INFO with subject/object so the operator has a weekly review queue ready to grow the vocabulary deliberately.
+
+**Robustness:** the function never raises. ANY failure (missing API key, API timeout, malformed JSON, prose-wrapped JSON, individual triple malformed) is caught and logged; caller gets `[]`. Input truncated at 30 KiB to bound cost. Confidence-below-threshold (0.5) triples dropped at parse time.
+
+**Coverage:** 24 unit tests — vocabulary sanity, code-fence stripping, JSON salvage from prose-wrapped responses, novel-predicate cross-check both directions, predicate snake_case normalization, entity-type whitelisting, oversize-input truncation, API-failure swallowing, missing-key handling.
+
+---
+
+### Fix 22: NEW — KG Extract Transaction Log (Cost Telemetry + Anomaly Detection)
+
+**File:** `mempalace/kg_extract_log.py` (NEW — 377 lines)
+
+Every call to `extract_triples()` now writes a row to a SQLite log co-located with the KG database. This gives operators auditable cost totals over time + automatic flagging of runaway spend before it accumulates.
+
+**Tracked per call:** timestamp, source (`tool_add_drawer` / `kg-backfill` / `manual`), drawer_id (when applicable), model used, input/output tokens, USD cost (computed from configurable rates), triples extracted, novel-predicate count, duration ms, status (`success`/`error`/`no_api_key`/`too_short`), error message (when applicable), anomaly flag.
+
+**Cost rates** (defaults from current Haiku 4.5 public pricing) tunable via env: `MEMPALACE_KG_PRICE_INPUT_PER_M` (default 0.80), `MEMPALACE_KG_PRICE_OUTPUT_PER_M` (default 4.00).
+
+**Anomaly detection** flags any successful call where EITHER:
+  - `cost_usd > MEMPALACE_KG_COST_ABSOLUTE_CEILING` (default $0.50 per call), OR
+  - `cost_usd > 3 × p95(last 50 successful calls)` — silent below the 10-call baseline to avoid noise on fresh deployments.
+
+Flagging is informational (logs at WARNING + writes the reason to the row); the call itself still succeeds and the triples still land. A grep over container logs surfaces every flagged call for review.
+
+**Reporting API:** `summarize(window_days=N, source=...)` aggregates calls / errors / skipped / total-cost-USD / p50/p95/max/avg-cost / total-triples / total-novel-predicates / anomalies-flagged / first-call / last-call.
+
+**Coverage:** 14 unit tests — cost math at default rates and with env overrides, success/error/skipped status separation, absolute-ceiling anomaly detection, p95-multiplier anomaly detection, baseline minimum (no-flag below 10 calls), per-source filtering, percentile correctness on real data, graceful empty-log handling.
+
+---
+
+### Fix 23: NEW — `tool_add_drawer` Post-Add Auto-Extract Hook
+
+**File:** `mempalace/mcp_server.py` (MODIFIED — `tool_add_drawer`)
+
+After a successful `col.upsert` of a drawer, when `MEMPALACE_KG_AUTO_EXTRACT=true` (default `false`) the drawer content is sent to `extract_triples()` and each result is persisted via `_kg.add_triple` with `source_file=drawer:<drawer_id>` so the KG can trace any fact back to the drawer it came from. Entity types, when known, are persisted via `_kg.add_entity` so the entities table gets typed correctly.
+
+**Default off** means deploying v6.0 changes nothing operationally until the operator flips the env var. This is deliberate — the foundation deploys at zero risk, and the cost-incurring behavior change is a separate, deliberate Coolify env-var edit by the operator.
+
+**Failure isolation:** the hook is wrapped in nested try/except. Any failure in extraction, in `add_entity`, in `add_triple`, or anywhere else logs at EXCEPTION level but the underlying drawer write itself remains successful. A drawer that fails to extract triples is still a successfully-filed drawer.
+
+The response payload gains an optional `triples_extracted: int` field when the hook ran, so callers can see at a glance how much KG content the drawer produced.
+
+---
+
+### Fix 24: NEW — `mempalace kg-backfill` CLI Subcommand
+
+**File:** `mempalace/kg_backfill.py` (NEW — 317 lines)
+**File:** `mempalace/cli.py` (MODIFIED — new subparser + dispatch entry)
+
+One-time / incremental bulk-extraction over the ~1,636 drawers that already exist in the palace before v6.0 wiring. Walks the ChromaDB collection in 500-drawer batches, calls `extract_triples()` on each, persists triples to KG.
+
+**Cost discipline built in:**
+  1. Pre-run scan counts drawers and prints estimated cost (uses `AVG_INPUT_TOKENS_PER_DRAWER × count × Haiku rates`).
+  2. Confirmation prompt — operator must type `yes` — unless `--yes` is passed for scripted runs.
+  3. `--dry-run` skips the API entirely, just reports the estimate.
+  4. `--limit N` for incremental top-up runs.
+  5. Every call goes through `kg_extract_log` so anomaly flagging fires during the run if any single drawer's cost is unexpectedly high.
+  6. `--stats` mode (with `--stats-source` and `--stats-window-days` filters) prints log totals and recent anomalies without running anything.
+
+**Idempotent:** re-running is safe. `KnowledgeGraph.add_triple` already de-dups identical `(subject, predicate, object, valid_to IS NULL)`, so repeated runs that re-extract the same drawer mostly produce dropped duplicates at the KG layer.
+
+**Resumable:** Ctrl-C between drawers stops cleanly and prints partial-run stats. The kg_extract_log already has the rows for the calls that completed, so the summary view is accurate even after an abort.
+
+---
+
+### Operational notes
+
+**To enable auto-extraction on new drawers** (after deploy):
+  1. Add `ANTHROPIC_API_KEY` to Coolify Environment Variables → Save.
+  2. Add `MEMPALACE_KG_AUTO_EXTRACT=true` to Coolify Environment Variables → Save.
+  3. Coolify auto-deploys; new drawers begin emitting triples on the next add.
+
+**To bootstrap the KG over existing drawers**:
+  1. Coolify → mempalace:main → Terminal.
+  2. Run `mempalace kg-backfill --dry-run` first to see drawer count + cost estimate.
+  3. Run `mempalace kg-backfill --limit 10` to spot-check quality on a small batch.
+  4. Run `mempalace kg-backfill --yes` for the full backfill.
+  5. Verify with `mempalace kg-backfill --stats` and `mempalace_kg_stats` MCP tool.
+
+**To audit cost over time:**
+  - `mempalace kg-backfill --stats` (all sources, all time)
+  - `mempalace kg-backfill --stats --stats-window-days 7` (last week)
+  - `mempalace kg-backfill --stats --stats-source tool_add_drawer` (just per-drawer auto-extract calls)
+
+**Rollback:** revert this commit. The KG remains as-is (any triples already extracted stay; no schema change to back out). The auto-extract hook, the backfill CLI, and the cost log are all gone — no behavior beyond what existed before v6.0.
