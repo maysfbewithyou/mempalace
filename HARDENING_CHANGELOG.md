@@ -267,3 +267,49 @@ Failure A (multi-minute timeouts on every operation) had a related root cause. `
   3. Tail server logs while exercising MCP. Healthcheck timeouts will now show explicit restart messages; on a healthy session you should see no orphan-discard warnings.
 
 **Rollback:** Revert this commit. The id-correlation logic, the healthcheck restart, and the timeout bump are all in one commit, so a single revert restores v0.1 behavior. Do not partial-revert: the three fixes are mutually reinforcing and behavior at intermediate states hasn't been tested.
+
+---
+
+## Version 4.0 — OAuth Refresh Token Support (2026-05-04)
+
+Targeted fix to the OAuth 2.1 provider used by Anthropic Connectors. Previously the access token expired after 1 hour with no way to refresh, forcing manual reconnect in claude.ai every hour. This version adds the standard `refresh_token` grant with single-use rotation, so reconnection is required only every 30 days (or after a detected token compromise).
+
+Module version: `mempalace/oauth.py` 0.2 → 0.3. Test suite: `tests/test_oauth.py` 0.1 → 0.2. All 25 OAuth tests pass (16 pre-existing + 9 new).
+
+Note on numbering: this is the second commit landed on main today after the V3.0 StdioProxy fix. Originally drafted as oauth-module v0.3 / changelog V3.0 on the feature branch, the changelog version was renumbered to V4.0 to slot in after V3.0=StdioProxy on main. The module version (oauth.py = v0.3) is unchanged from the feature-branch draft.
+
+---
+
+### Fix 19: HIGH — OAuth Access Tokens Expired Without Refresh Path
+**File:** `mempalace/oauth.py` (MODIFIED — v0.2 → v0.3)
+**File:** `tests/test_oauth.py` (MODIFIED — v0.1 → v0.2)
+
+**Problem:** The `/oauth/token` endpoint only supported `client_credentials` and `authorization_code` grants. Both issued a JWT access token with a 1-hour TTL and no refresh mechanism. When the JWT expired, claude.ai's connector showed "Connection has expired" and the user had to manually click "Connect" — re-running the entire authorization_code+PKCE handshake. With the connector in active daily use, this meant 8–10+ reconnects per day, and several recent expiries appeared to occur mid-session, silently breaking MCP calls until the user noticed the banner.
+
+The OAuth metadata at `/.well-known/oauth-authorization-server` advertised only `["authorization_code", "client_credentials"]` in `grant_types_supported`, so even if a client tried `grant_type=refresh_token` opportunistically, the server returned `unsupported_grant_type`.
+
+**Solution:** Implemented the standard `refresh_token` grant per RFC 6749 §6 with single-use rotation per RFC 6749 §10.4:
+
+1. **Refresh token issuance.** The `authorization_code` grant now returns BOTH `access_token` (JWT, 1h TTL — unchanged) AND `refresh_token` (opaque random string, 30-day TTL by default). Refresh tokens are deliberately opaque, not JWTs — verification needs server-side state for rotation/revocation anyway, so opaque tokens avoid duplicating that state in a JWT payload.
+
+2. **Refresh token storage.** New module-level `_REFRESH_TOKENS` dict alongside the existing `_AUTHZ_CODES` dict. Single uvicorn worker (A4 constraint) means single-process; an in-memory dict is sufficient. Each entry records `client_id`, `scope`, `resource`, `expires_at`, `used`.
+
+3. **Single-use rotation.** Each successful `grant_type=refresh_token` call marks the old RT as `used=True` and mints a fresh RT for the next refresh. The legitimate client always holds the most recent RT.
+
+4. **Reuse detection.** Used RTs are deliberately NOT garbage-collected on use — they remain in the dict until natural expiry. If a stolen RT is replayed after the legitimate client has already rotated, the server returns `invalid_grant` with `"refresh_token already used"` rather than `"Unknown refresh_token"`. This preserves the RFC §10.4 compromise-indicator signal so the user can see (in logs) that someone else is trying to use their token.
+
+5. **Server metadata.** `/.well-known/oauth-authorization-server` now advertises `"refresh_token"` in `grant_types_supported`, so Anthropic's connector backend knows it can use the new flow.
+
+6. **New env var.** `MEMPALACE_OAUTH_REFRESH_TTL` (defaults to `2592000` = 30 days). Tunable independently of access-token TTL.
+
+**Breaking changes:** None for users. The metadata change is backwards-compatible — clients that don't recognize `refresh_token` in `grant_types_supported` will simply ignore it and continue using `authorization_code`. The `authorization_code` response payload gains a new `refresh_token` field; clients that ignore unknown fields (which is most of them) are unaffected.
+
+**Operational changes:** Each successful authorization_code or refresh now adds an entry to `_REFRESH_TOKENS`. The dict grows during the 30-day window, but with one user and single-digit refreshes per day, peak size is a few hundred entries — negligible memory impact. Used entries auto-evict at natural expiry via `_gc_expired_refresh_tokens()` on the next refresh request.
+
+**How to test:**
+1. Reconnect MemPalace in claude.ai; observe the connector status flips from "Expired" to "Connected".
+2. Wait 1+ hour and use a MemPalace tool. Without v0.3 you'd see "Connection has expired"; with v0.3 the call succeeds because Anthropic silently refreshed the access token.
+3. Run `pytest tests/test_oauth.py -v` — all 25 tests should pass, including the new `test_refresh_token_rotation_invalidates_old`, `test_refresh_token_grant_happy_path`, `test_refresh_token_client_mismatch_rejected`, etc.
+4. Tail the server log; on a successful rotation you'll see `oauth: rotated refresh_token (grant=refresh_token)`. On an attempted reuse you'll see `oauth: refresh_token reuse detected — rejecting`.
+
+**Rollback:** Revert this commit. The metadata change is backwards-compatible so clients keep working with `authorization_code` only — they'll just hit the expired-token problem again until reconnect.

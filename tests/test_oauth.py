@@ -1,8 +1,10 @@
-"""Tests for the OAuth 2.0 client_credentials provider.
+"""Tests for the OAuth 2.0 provider.
 
-version: 0.1
+version: 0.2 (added refresh_token grant tests; rollback to 0.1 by deleting
+              the "refresh_token grant" section)
 phase: 10
-covers: mempalace.oauth (token endpoint, metadata, JWT issue/verify)
+covers: mempalace.oauth (token endpoint, metadata, JWT issue/verify,
+        refresh_token issuance + rotation + reuse detection)
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from mempalace import oauth  # noqa: E402
 def app():
     """A minimal Starlette app exposing only the OAuth endpoints — no auth middleware."""
     return Starlette(routes=[
+        Route("/authorize", oauth.authorize_endpoint, methods=["GET"]),
         Route("/oauth/token", oauth.token_endpoint, methods=["POST"]),
         Route(
             "/.well-known/oauth-authorization-server",
@@ -49,6 +52,18 @@ def app():
             methods=["GET"],
         ),
     ])
+
+
+@pytest.fixture(autouse=True)
+def _clear_oauth_state():
+    """Refresh tokens and authz codes live in module-level dicts. Clear between
+    tests so one test's leftover RT can't affect another's reuse-detection logic.
+    """
+    oauth._REFRESH_TOKENS.clear()
+    oauth._AUTHZ_CODES.clear()
+    yield
+    oauth._REFRESH_TOKENS.clear()
+    oauth._AUTHZ_CODES.clear()
 
 
 @pytest.fixture
@@ -241,3 +256,221 @@ def test_jwt_secret_min_length(monkeypatch):
     monkeypatch.setenv("MEMPALACE_OAUTH_JWT_SECRET", "short")
     with pytest.raises(RuntimeError, match=">=32"):
         oauth._get_jwt_secret()
+
+
+# ── refresh_token grant (v0.3) ────────────────────────────────────────────────
+#
+# These tests drive the token endpoint at the form-body level for client_creds,
+# and exercise issue_refresh_token() directly to seed RT state for the refresh
+# flow. We don't run the /authorize PKCE dance here — that's covered by the
+# authorization_code-flow tests above and the AC integration test below.
+
+
+import hashlib  # noqa: E402  — used by the AC-flow integration test
+
+
+def _seed_refresh_token(client_id: str = VALID_CLIENT_ID) -> str:
+    """Helper: mint a refresh token bound to client_id and return the RT string."""
+    rt, _ttl = oauth.issue_refresh_token(client_id, scope="mcp")
+    return rt
+
+
+def test_refresh_token_grant_happy_path(client):
+    rt = _seed_refresh_token()
+    r = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": rt,
+            "client_id": VALID_CLIENT_ID,
+            "client_secret": VALID_CLIENT_SECRET,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["token_type"] == "Bearer"
+    assert body["expires_in"] > 0
+    assert oauth.verify_jwt(body["access_token"]) is True
+    # A new RT was issued and it's different from the one we sent.
+    assert "refresh_token" in body
+    assert body["refresh_token"] != rt
+
+
+def test_refresh_token_rotation_invalidates_old(client):
+    """After a successful refresh, the OLD refresh_token must be rejected."""
+    rt = _seed_refresh_token()
+    r1 = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": rt,
+            "client_id": VALID_CLIENT_ID,
+            "client_secret": VALID_CLIENT_SECRET,
+        },
+    )
+    assert r1.status_code == 200
+    new_rt = r1.json()["refresh_token"]
+
+    # Reusing the original RT must now fail.
+    r2 = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": rt,
+            "client_id": VALID_CLIENT_ID,
+            "client_secret": VALID_CLIENT_SECRET,
+        },
+    )
+    assert r2.status_code == 400
+    assert r2.json()["error"] == "invalid_grant"
+    assert "used" in r2.json()["error_description"].lower()
+
+    # But the NEW RT still works.
+    r3 = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": new_rt,
+            "client_id": VALID_CLIENT_ID,
+            "client_secret": VALID_CLIENT_SECRET,
+        },
+    )
+    assert r3.status_code == 200
+
+
+def test_refresh_token_unknown_rejected(client):
+    r = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": "not-a-real-refresh-token",
+            "client_id": VALID_CLIENT_ID,
+            "client_secret": VALID_CLIENT_SECRET,
+        },
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_grant"
+
+
+def test_refresh_token_missing_rejected(client):
+    r = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "client_id": VALID_CLIENT_ID,
+            "client_secret": VALID_CLIENT_SECRET,
+        },
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_request"
+
+
+def test_refresh_token_expired_rejected(client):
+    """An RT past its expires_at should be rejected and garbage-collected."""
+    rt = _seed_refresh_token()
+    # Force expiry by rewinding the stored expires_at.
+    oauth._REFRESH_TOKENS[rt]["expires_at"] = 1.0  # Unix epoch + 1s
+    r = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": rt,
+            "client_id": VALID_CLIENT_ID,
+            "client_secret": VALID_CLIENT_SECRET,
+        },
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_grant"
+    # GC ran and the entry is gone.
+    assert rt not in oauth._REFRESH_TOKENS
+
+
+def test_refresh_token_client_mismatch_rejected(client):
+    """An RT presented with a different client_id must be rejected, even if
+    that client_id authenticates with valid credentials."""
+    # Bind the RT to a *different* (fake) client.
+    rt, _ = oauth.issue_refresh_token("some-other-client-id-padding")
+    r = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": rt,
+            "client_id": VALID_CLIENT_ID,
+            "client_secret": VALID_CLIENT_SECRET,
+        },
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_grant"
+
+
+def test_metadata_advertises_refresh_token(client):
+    r = client.get("/.well-known/oauth-authorization-server")
+    assert r.status_code == 200
+    grants = r.json()["grant_types_supported"]
+    assert "refresh_token" in grants
+    assert "authorization_code" in grants
+    assert "client_credentials" in grants
+
+
+def test_authorization_code_flow_returns_refresh_token(client):
+    """Integration: walk /authorize → /oauth/token (authorization_code) and
+    confirm the response includes a refresh_token alongside the access_token.
+    """
+    # PKCE: pick a verifier, compute the S256 challenge.
+    import base64 as _b64
+    verifier = "v" * 64  # 64 chars, in [43,128] per RFC 7636
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = _b64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+    redirect_uri = oauth._allowed_redirect_uri()
+
+    # 1. /authorize → 302 redirect with ?code=...&state=...
+    auth_resp = client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": VALID_CLIENT_ID,
+            "redirect_uri": redirect_uri,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "xyz-state",
+            "scope": "mcp",
+        },
+        follow_redirects=False,
+    )
+    assert auth_resp.status_code == 302
+    location = auth_resp.headers["location"]
+    # Pull the code out of the redirect URL.
+    from urllib.parse import urlparse, parse_qs
+    qs = parse_qs(urlparse(location).query)
+    code = qs["code"][0]
+    assert qs["state"][0] == "xyz-state"
+
+    # 2. /oauth/token with grant_type=authorization_code.
+    tok_resp = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": redirect_uri,
+            "client_id": VALID_CLIENT_ID,
+            "client_secret": VALID_CLIENT_SECRET,
+        },
+    )
+    assert tok_resp.status_code == 200, tok_resp.text
+    body = tok_resp.json()
+    assert "access_token" in body
+    assert "refresh_token" in body
+    assert body["token_type"] == "Bearer"
+    assert oauth.verify_jwt(body["access_token"]) is True
+
+
+def test_issue_refresh_token_helper_round_trip():
+    rt, ttl = oauth.issue_refresh_token(VALID_CLIENT_ID, scope="mcp")
+    assert isinstance(rt, str) and len(rt) > 30
+    assert ttl == 30 * 24 * 3600  # default 30 days
+    entry = oauth._REFRESH_TOKENS[rt]
+    assert entry["client_id"] == VALID_CLIENT_ID
+    assert entry["scope"] == "mcp"
+    assert entry["used"] is False
