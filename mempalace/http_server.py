@@ -1,8 +1,26 @@
 """HTTP transport wrapper for the MemPalace MCP server.
 
-version: 0.1
-phase: 2a
+version: 0.2
+phase: 2a (extended)
 locked architecture: MemPalace_Phase_2_Architecture_v0.2.md (A1–A8)
+
+Version history:
+  0.1 — initial subprocess-proxy wrapper (single asyncio.Lock, one readline
+        per request, restart on inner timeout / EOF / decode error)
+  0.2 — fix StdioProxy buffer corruption that produced "wrong-shape" tool
+        responses. Three concurrent changes (rollback to 0.1 by reverting
+        this commit; behavior is backwards-compatible):
+          a) _request_locked now matches responses by JSON-RPC id and
+             discards orphans (max 16) instead of blindly returning the
+             first readline. Cancellation of a previous read (e.g. by a
+             healthcheck wait_for) used to leave the in-flight response in
+             the StreamReader buffer, where the next request would consume
+             it and surface as a wrong-shaped tool result.
+          b) healthcheck() now triggers _restart() on outer timeout so
+             stale buffer state can't leak across the healthcheck boundary.
+          c) REQUEST_TIMEOUT_SECONDS default raised 30s -> 120s. ChromaDB
+             cold-start (ONNX model load + first embedding) routinely
+             exceeds 30s, which was triggering spurious restart loops.
 
 Purpose
 -------
@@ -141,8 +159,13 @@ def _get_subprocess_cmd() -> list[str]:
     ]
 
 
-REQUEST_TIMEOUT_SECONDS = float(os.environ.get("MEMPALACE_REQUEST_TIMEOUT", "30"))
+REQUEST_TIMEOUT_SECONDS = float(os.environ.get("MEMPALACE_REQUEST_TIMEOUT", "120"))
 HEALTH_TIMEOUT_SECONDS = float(os.environ.get("MEMPALACE_HEALTH_TIMEOUT", "5"))
+# Max stale/orphan responses to discard before forcing a subprocess restart.
+# In practice we expect 0 orphans on a healthy session; >1 indicates buffer
+# corruption from a prior cancellation. The cap prevents a misbehaving
+# subprocess from spinning us forever.
+MAX_ORPHAN_RESPONSES = 16
 
 
 # ── Bootstrap (A7) ───────────────────────────────────────────────────────────
@@ -304,6 +327,8 @@ class StdioProxy:
         assert proc.stdin is not None
         assert proc.stdout is not None
 
+        expected_id = payload.get("id")
+
         # Encode and send
         line = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
         try:
@@ -314,27 +339,66 @@ class StdioProxy:
             await self._restart()
             return await self._request_locked(payload)
 
-        # Read one response line, with timeout
-        try:
-            raw = await asyncio.wait_for(
-                proc.stdout.readline(),
-                timeout=REQUEST_TIMEOUT_SECONDS,
+        # Read responses in a loop, discarding any whose JSON-RPC id doesn't
+        # match `expected_id`. This is the v0.2 fix for buffer corruption:
+        # if a previous request's readline was canceled (typically by a
+        # healthcheck wait_for) the in-flight response can land in the
+        # StreamReader's buffer AFTER cancellation. Without this loop the
+        # next caller would consume that orphan as its own response,
+        # producing a "wrong-shape" tool result (e.g. mempalace_kg_query
+        # receiving the previous tool's status payload).
+        for _ in range(MAX_ORPHAN_RESPONSES + 1):
+            try:
+                raw = await asyncio.wait_for(
+                    proc.stdout.readline(),
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "stdio_proxy: response timeout (>%ss); restarting",
+                    REQUEST_TIMEOUT_SECONDS,
+                )
+                await self._restart()
+                raise
+
+            if not raw:
+                logger.error("stdio_proxy: subprocess EOF; restarting")
+                await self._restart()
+                return await self._request_locked(payload)
+
+            try:
+                response = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                logger.error(
+                    "stdio_proxy: invalid JSON from subprocess: %s; raw=%r",
+                    exc, raw[:200],
+                )
+                # Treat as orphan: skip and keep reading. Stray non-JSON
+                # output (e.g. a library writing progress to stdout) should
+                # not crash the session.
+                continue
+
+            response_id = response.get("id")
+            if response_id == expected_id:
+                return response
+
+            logger.warning(
+                "stdio_proxy: discarding orphan response id=%r (expected %r); "
+                "likely buffer leftover from a canceled or timed-out earlier call",
+                response_id, expected_id,
             )
-        except asyncio.TimeoutError:
-            logger.error("stdio_proxy: response timeout (>%ss); restarting", REQUEST_TIMEOUT_SECONDS)
-            await self._restart()
-            raise
 
-        if not raw:
-            logger.error("stdio_proxy: subprocess EOF; restarting")
-            await self._restart()
-            return await self._request_locked(payload)
-
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            logger.error("stdio_proxy: invalid JSON from subprocess: %s; raw=%r", exc, raw[:200])
-            raise
+        # Exceeded the orphan budget — the subprocess is misbehaving badly.
+        # Force a restart and fail this request so the caller can retry.
+        logger.error(
+            "stdio_proxy: too many orphan responses (>%d); restarting",
+            MAX_ORPHAN_RESPONSES,
+        )
+        await self._restart()
+        raise RuntimeError(
+            f"stdio_proxy: subprocess emitted >{MAX_ORPHAN_RESPONSES} "
+            "orphan responses; restarted"
+        )
 
     async def _restart(self) -> None:
         """Stop (if alive) and re-spawn."""
@@ -346,7 +410,13 @@ class StdioProxy:
     async def healthcheck(self) -> bool:
         """Send an MCP `initialize` and return True if a JSON-RPC response comes back in time.
 
-        Used by the /health endpoint. Wraps in its own short timeout.
+        Used by the /ready endpoint. Wraps in its own short timeout.
+
+        v0.2: on outer-timeout we now trigger _restart(). Reason — even with
+        v0.2's id-correlation in _request_locked tolerating buffer orphans,
+        a slow healthcheck signals the subprocess is in a bad state, and
+        restarting now puts it back to a known-good state faster than
+        waiting for the next real request to discover the problem.
         """
         ping = {
             "jsonrpc": "2.0",
@@ -355,12 +425,22 @@ class StdioProxy:
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "mempalace-http", "version": "0.1"},
+                "clientInfo": {"name": "mempalace-http", "version": "0.2"},
             },
         }
         try:
             resp = await asyncio.wait_for(self.request(ping), timeout=HEALTH_TIMEOUT_SECONDS)
-        except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+        except asyncio.TimeoutError:
+            logger.warning(
+                "healthcheck: outer timeout (>%ss); subprocess unresponsive — restarting",
+                HEALTH_TIMEOUT_SECONDS,
+            )
+            try:
+                await self._restart()
+            except Exception:  # noqa: BLE001
+                logger.exception("healthcheck: restart attempt also failed")
+            return False
+        except Exception as exc:  # noqa: BLE001
             logger.warning("healthcheck: failed (%s)", exc)
             return False
         return isinstance(resp, dict) and resp.get("id") == "healthcheck"

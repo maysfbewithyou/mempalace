@@ -218,3 +218,52 @@ These items were identified in the audit but are lower priority or require archi
 3. **Wikipedia API response validation** — `entity_registry.py` fetches and deserializes Wikipedia JSON without schema validation. Low risk since Wikipedia is a trusted source, but could be hardened.
 4. **No encryption at rest** — palace database and WAL files are stored in plaintext. Optional AES-256-GCM encryption would be a good future addition.
 5. **Error messages may leak internal paths** — some exception handlers return full error strings. A future pass should sanitize error responses to remove file paths and stack traces.
+
+---
+
+## Version 3.0 — StdioProxy Buffer Corruption Fix (2026-05-04)
+
+Repair to the HTTP→stdio bridge that wraps the upstream MCP server. Two failure modes were observed in production:
+
+  - **Failure A (timeouts):** every tool call hit a multi-minute timeout — discovery (`tool_search`) returned schemas correctly, but operational endpoints (`mempalace_status`, `mempalace_add_drawer`, etc.) didn't return.
+  - **Failure B (wrong-shape returns):** some calls returned the wrong handler's payload — e.g. `mempalace_kg_query` got a `status`-shaped response, `mempalace_list_wings` got a `traverse`-shaped response, `mempalace_check_duplicate` got a `kg_query`-shaped response. Reproducible across two sessions on 2026-04-30 and 2026-05-04.
+
+Module version: `mempalace/http_server.py` 0.1 → 0.2. Test suite: `tests/test_http_server.py` 0.1 → 0.2. All 24 HTTP-wrapper tests pass (20 pre-existing + 4 new buffer-corruption regression tests).
+
+---
+
+### Fix 18: HIGH — StdioProxy Buffer Corruption + Cold-Start Timeouts
+**File:** `mempalace/http_server.py` (MODIFIED — v0.1 → v0.2)
+**File:** `tests/test_http_server.py` (MODIFIED — v0.1 → v0.2)
+
+**Problem:** `StdioProxy` proxies HTTP MCP requests to a single-threaded stdio subprocess (`mempalace.mcp_server`). Concurrent HTTP callers serialize on a single `asyncio.Lock` and each request reads exactly one line of subprocess stdout via `proc.stdout.readline()`. The proxy assumed a strict 1-line-per-response invariant.
+
+That invariant breaks when a `readline()` is canceled mid-flight. The most common trigger is `healthcheck()` (used by `/ready`), which wraps `self.request(ping)` in an outer `asyncio.wait_for(timeout=HEALTH_TIMEOUT_SECONDS=5s)`. If the subprocess takes 5–30s to respond (perfectly normal during ChromaDB cold-start), the outer timeout fires:
+
+  1. The inner `proc.stdout.readline()` is canceled. `asyncio.CancelledError` propagates.
+  2. The `async with self._lock:` block releases the lock. **No `_restart()` is called** — restart only fires on the inner `asyncio.TimeoutError` raised at line 323.
+  3. The subprocess's response *still arrives* in the OS pipe and the asyncio `StreamReader` buffer.
+  4. The next legitimate HTTP request acquires the lock, writes its payload to stdin, calls `readline()` — and reads the **previous** request's response from the buffer.
+
+That perfectly produces Failure B's wrong-handler-shape pattern: request N+1 receives request N's response, so a tool call appears to "work" but with stale data shaped for a different tool. Once a session falls into this state, every subsequent call is shifted by one — repeatedly returning prior tool's responses to current callers, which the user perceives as randomly-broken tool routing or generic `"Error occurred during tool execution"` failures when claude.ai's schema validator catches the mismatch.
+
+Failure A (multi-minute timeouts on every operation) had a related root cause. `REQUEST_TIMEOUT_SECONDS` defaulted to 30s — too short for ChromaDB's first call after a cold subprocess (ONNX model load + first embedding can run 60–120s). The 30s timeout fires repeatedly, every restart cycle re-pays the cold-start cost, and the user observes the behavior as their MCP client's longer outer timeout (e.g. claude.ai's 5-minute MCP timeout). The buffer-corruption issue compounds this: even when the subprocess does eventually respond, the response was probably already misrouted.
+
+**Solution:** Three concurrent fixes in `http_server.py`:
+
+  1. **JSON-RPC id correlation in `_request_locked`.** After writing the request payload, loop on `readline()`. Compare `response.get("id")` to `payload.get("id")` and discard any mismatch as an orphan (with a warning log). After `MAX_ORPHAN_RESPONSES = 16` orphans, force `_restart()` and raise — the subprocess is misbehaving badly enough to abandon. This means cancellation orphans can no longer poison the next caller, regardless of where the cancellation originated.
+
+  2. **`healthcheck()` now triggers `_restart()` on outer timeout.** Even with id-correlation tolerating buffer leftovers, a slow healthcheck signals the subprocess is in a bad state. Restarting now puts it back to a known-good state faster than waiting for the next real call to discover the problem. Backwards-compatible: `healthcheck()` still returns `False` on timeout — the new behavior is only the implicit subprocess restart.
+
+  3. **`REQUEST_TIMEOUT_SECONDS` default raised 30s → 120s.** Still tunable via `MEMPALACE_REQUEST_TIMEOUT` env var. Reflects the reality that ChromaDB cold-start operations need more headroom than a warmed-up wrapper does.
+
+**Breaking changes:** None. The id-correlation and restart behaviors are strictly additive; existing callers that didn't trigger the bug see no change. The timeout bump only enlarges the patience for slow operations — it doesn't change the behavior of fast ones.
+
+**Operational changes:** Healthcheck-triggered restarts are now visible in logs as `healthcheck: outer timeout (>5s); subprocess unresponsive — restarting`. Orphan-response discards log as `stdio_proxy: discarding orphan response id=...`. Both are diagnostic — neither indicates user-facing failure. If you see a sustained stream of orphan-discard warnings, that's a sign of underlying subprocess instability worth investigating (memory pressure, ChromaDB DB lock, etc.).
+
+**How to test:**
+  1. Reconnect MemPalace in claude.ai, then run a sequence of tool calls — `mempalace_status`, then `mempalace_kg_query`, then `mempalace_list_wings`. All three should return correctly-shaped responses for their respective tools.
+  2. Run `pytest tests/test_http_server.py -v` — 24 tests should pass, including 4 new tests covering the buffer-corruption fix: `test_stdio_proxy_discards_orphan_response_with_wrong_id`, `test_stdio_proxy_discards_multiple_orphans_then_returns_real`, `test_stdio_proxy_restarts_after_too_many_orphans`, `test_healthcheck_outer_timeout_triggers_restart`.
+  3. Tail server logs while exercising MCP. Healthcheck timeouts will now show explicit restart messages; on a healthy session you should see no orphan-discard warnings.
+
+**Rollback:** Revert this commit. The id-correlation logic, the healthcheck restart, and the timeout bump are all in one commit, so a single revert restores v0.1 behavior. Do not partial-revert: the three fixes are mutually reinforcing and behavior at intermediate states hasn't been tested.

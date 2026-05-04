@@ -1,8 +1,9 @@
 """Tests for the IEP fork's HTTP/MCP wrapper.
 
-version: 0.1
-phase: 2a
-covers: mempalace.http_server
+version: 0.2
+phase: 2a (extended)
+covers: mempalace.http_server (incl. v0.2 buffer-corruption fix)
+rollback: revert to 0.1 by deleting the "v0.2 buffer corruption" test section.
 """
 
 from __future__ import annotations
@@ -447,6 +448,194 @@ def test_stdio_proxy_handles_subprocess_crash(tmp_path):
             r2 = await proxy.request({"jsonrpc": "2.0", "id": 2, "method": "x"})
             assert r2["result"] == "first"
             assert proxy._restart_count >= 1
+        finally:
+            await proxy.stop()
+
+    asyncio.run(run())
+
+
+# ── v0.2 buffer corruption regression tests ─────────────────────────────────
+#
+# These tests guard the StdioProxy fix landed in http_server.py v0.2. The
+# original bug: when a previous request's readline() was canceled (typically
+# by a healthcheck wait_for firing during a slow chromadb cold-start), the
+# in-flight response could land in the asyncio StreamReader buffer AFTER
+# cancellation. The next legitimate request would then consume that orphan
+# response as its own — surfacing in claude.ai as a "wrong-shape" tool result
+# (e.g. mempalace_kg_query receiving the previous tool's status payload).
+#
+# The fix has three parts: (a) JSON-RPC id correlation in _request_locked
+# loops past orphans up to MAX_ORPHAN_RESPONSES; (b) healthcheck() restarts
+# the subprocess on outer timeout; (c) REQUEST_TIMEOUT_SECONDS bumped to 120s
+# so chromadb cold-start no longer triggers spurious restarts.
+
+
+def test_stdio_proxy_discards_orphan_response_with_wrong_id(tmp_path):
+    """Subprocess emits an unrelated response BEFORE the real one (simulating
+    a leftover from a canceled earlier request). Proxy must skip it and
+    return the real response, not the orphan."""
+    script = tmp_path / "leaky_server.py"
+    script.write_text(textwrap.dedent("""
+        import json, sys
+        # Pre-emit an orphan response with a stale id (simulates the leftover
+        # from a previous request whose readline was canceled).
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0",
+            "id": "stale-orphan",
+            "result": {"echoed": "stale_method"},
+        }) + "\\n")
+        sys.stdout.flush()
+        # Now act normally.
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            req = json.loads(line)
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req.get("id"),
+                "result": {"echoed": req.get("method", "")},
+            }
+            sys.stdout.write(json.dumps(resp) + "\\n")
+            sys.stdout.flush()
+    """))
+
+    async def run():
+        proxy = http_server.StdioProxy(cmd=[sys.executable, "-u", str(script)])
+        await proxy.start()
+        try:
+            resp = await proxy.request(
+                {"jsonrpc": "2.0", "id": "real-1", "method": "tools/list"}
+            )
+            # MUST get the real response, not the stale orphan.
+            assert resp["id"] == "real-1", f"Got orphan instead of real: {resp}"
+            assert resp["result"]["echoed"] == "tools/list"
+        finally:
+            await proxy.stop()
+
+    asyncio.run(run())
+
+
+def test_stdio_proxy_discards_multiple_orphans_then_returns_real(tmp_path):
+    """Subprocess emits 3 orphans before responding correctly — proxy should
+    walk past all of them up to MAX_ORPHAN_RESPONSES."""
+    script = tmp_path / "multi_orphan_server.py"
+    script.write_text(textwrap.dedent("""
+        import json, sys
+        # Emit 3 orphans first.
+        for i in range(3):
+            sys.stdout.write(json.dumps({
+                "jsonrpc": "2.0",
+                "id": f"orphan-{i}",
+                "result": {"echoed": f"orphan_method_{i}"},
+            }) + "\\n")
+            sys.stdout.flush()
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            req = json.loads(line)
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req.get("id"),
+                "result": {"echoed": req.get("method", "")},
+            }
+            sys.stdout.write(json.dumps(resp) + "\\n")
+            sys.stdout.flush()
+    """))
+
+    async def run():
+        proxy = http_server.StdioProxy(cmd=[sys.executable, "-u", str(script)])
+        await proxy.start()
+        try:
+            resp = await proxy.request(
+                {"jsonrpc": "2.0", "id": "real-2", "method": "real_method"}
+            )
+            assert resp["id"] == "real-2", f"Got orphan: {resp}"
+            assert resp["result"]["echoed"] == "real_method"
+        finally:
+            await proxy.stop()
+
+    asyncio.run(run())
+
+
+def test_stdio_proxy_restarts_after_too_many_orphans(tmp_path):
+    """If the subprocess emits more than MAX_ORPHAN_RESPONSES garbage replies,
+    the proxy gives up, raises, and triggers a restart (so the next caller
+    gets a fresh subprocess instead of being stuck in a bad state)."""
+    n_orphans = http_server.MAX_ORPHAN_RESPONSES + 2
+    script = tmp_path / "spam_server.py"
+    script.write_text(textwrap.dedent(f"""
+        import json, sys
+        # Emit MAX_ORPHAN_RESPONSES + 2 garbage responses, then go silent.
+        for i in range({n_orphans}):
+            sys.stdout.write(json.dumps({{
+                "jsonrpc": "2.0",
+                "id": f"spam-{{i}}",
+                "result": "x",
+            }}) + "\\n")
+            sys.stdout.flush()
+        # Drain stdin but never respond.
+        for line in sys.stdin:
+            pass
+    """))
+
+    async def run():
+        proxy = http_server.StdioProxy(cmd=[sys.executable, "-u", str(script)])
+        await proxy.start()
+        try:
+            with pytest.raises(RuntimeError, match="orphan"):
+                await proxy.request(
+                    {"jsonrpc": "2.0", "id": "real", "method": "x"}
+                )
+            # The proxy should have triggered _restart() inside the failure
+            # path so the next legitimate caller gets a clean subprocess.
+            assert proxy._restart_count >= 1
+        finally:
+            await proxy.stop()
+
+    asyncio.run(run())
+
+
+def test_healthcheck_outer_timeout_triggers_restart(tmp_path, monkeypatch):
+    """If healthcheck()'s outer wait_for fires while the subprocess is still
+    computing, the proxy must restart so any in-flight response can't poison
+    the buffer for the next legitimate caller."""
+    # Subprocess that takes 2s before responding — too slow for the tiny
+    # healthcheck timeout we're about to set, but fast enough to keep the
+    # test quick.
+    slow = tmp_path / "slow_init.py"
+    slow.write_text(textwrap.dedent("""
+        import json, sys, time
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            req = json.loads(line)
+            time.sleep(2.0)
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req.get("id"),
+                "result": {"echoed": req.get("method", "")},
+            }
+            sys.stdout.write(json.dumps(resp) + "\\n")
+            sys.stdout.flush()
+    """))
+
+    # Force a tiny healthcheck timeout so we don't have to wait long.
+    monkeypatch.setattr(http_server, "HEALTH_TIMEOUT_SECONDS", 0.3)
+
+    async def run():
+        proxy = http_server.StdioProxy(cmd=[sys.executable, "-u", str(slow)])
+        await proxy.start()
+        try:
+            healthy = await proxy.healthcheck()
+            assert healthy is False  # outer timeout fired
+            # v0.2 contract: the timeout path should have called _restart().
+            assert proxy._restart_count >= 1, (
+                "healthcheck timeout did not trigger restart — buffer state "
+                "could leak to the next caller"
+            )
         finally:
             await proxy.stop()
 
