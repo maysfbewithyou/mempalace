@@ -466,3 +466,61 @@ One-time / incremental bulk-extraction over the ~1,636 drawers that already exis
   - `mempalace kg-backfill --stats --stats-source tool_add_drawer` (just per-drawer auto-extract calls)
 
 **Rollback:** revert this commit. The KG remains as-is (any triples already extracted stay; no schema change to back out). The auto-extract hook, the backfill CLI, and the cost log are all gone — no behavior beyond what existed before v6.0.
+
+---
+
+## Version 6.1 — Subscription-Side KG Extraction Path (2026-05-04)
+
+Follow-up to v6.0 in response to "why does this need an Anthropic API key when I already pay for a Claude.ai subscription?". v6.1 adds a single MCP tool that lets a Cowork scheduled task walk the palace and extract triples using the operator's existing claude.ai subscription — zero API spend, no separate billing account, no env var needed.
+
+The v6.0 server-side hook + API path remains in place but inert (default-off flag). The two extraction paths now coexist; operators pick whichever they prefer based on their realtime-vs-cost trade-off.
+
+---
+
+### Fix 25: NEW — `mempalace_list_unextracted_drawers` MCP Tool
+
+**File:** `mempalace/mcp_server.py` (NEW tool + handler + TOOLS-dict entry)
+**File:** `mempalace/knowledge_graph.py` (NEW helper method)
+
+**Problem:** v6.0 shipped two extraction paths — the inline `tool_add_drawer` post-add hook (gated by `MEMPALACE_KG_AUTO_EXTRACT`) and the `mempalace kg-backfill` CLI. Both call the Anthropic API directly, which requires the operator to provision an `ANTHROPIC_API_KEY` env var with separate billing. For an operator who already has a Claude.ai (or Cowork) subscription, that's a redundant payment for the same compute they're already buying.
+
+**Solution:** Expose a new MCP read tool that returns drawers without any KG triples filed against them, so a Cowork scheduled task can use the operator's existing subscription to walk the queue:
+
+  - **`KnowledgeGraph.list_source_drawer_ids() -> set[str]`** — new helper method. Queries `triples` for `source_file LIKE 'drawer:%'`, strips the prefix, returns the set of drawer IDs that already have at least one triple. Returns an empty set on any error so an uninitialized KG db doesn't break the read tool.
+
+  - **`mempalace_list_unextracted_drawers(limit=50, since_date=None)`** — new MCP tool. Walks the ChromaDB collection in 500-drawer batches, filters out drawers in the extracted-set, optionally filters by `metadata.filed_at >= since_date`, returns up to `limit` drawers (1–200, default 50) with full content + metadata. Also returns `total_unextracted` so the caller can see how big the queue still is.
+
+The tool description in `TOOLS` includes explicit guidance for an LLM agent: "for each returned drawer, extract subject-predicate-object triples using the v0.1 vocabulary, then persist via `mempalace_kg_add`." A scheduled-task Claude reads that description as part of its tool catalog.
+
+**Why this is the optimal path for operators with a Claude.ai subscription:**
+
+  1. The subscription already covers the inference compute. The API path is paying twice for the same model.
+  2. A Cowork scheduled task is exactly the right granularity — daily or 6-hourly batches catch any drawers added since the last run and extract them, with no per-drawer latency cost on the write path.
+  3. Anomaly detection is unnecessary here because there is no per-call dollar cost to monitor.
+  4. The full chain (read drawer → reason about content → emit triples → write via `mempalace_kg_add`) all happens inside the user's subscription quota.
+
+**Trade-off vs v6.0 server-side hook:**
+
+  | | Subscription scheduled task | API-key server hook |
+  | --- | --- | --- |
+  | $/month | $0 | ~$1/mo at typical write rates |
+  | Drawer → KG latency | up to N hours (interval) | seconds (real-time) |
+  | Anomaly telemetry | n/a | built in |
+  | Setup | one Cowork scheduled task | one Coolify env var |
+
+Both paths share the same `source_file=drawer:<id>` linkage, so a triple's drawer of origin is queryable regardless of which path produced it. They also de-conflict naturally: the scheduled task only sees drawers without triples, so if the API-key hook runs first, the scheduled task simply skips that drawer next cycle.
+
+**Breaking changes:** None. Pure additive — one new tool, one new helper method, no schema change, no behavior change to existing tools.
+
+**How to test:**
+  1. After deploy, in claude.ai or Cowork: call `mempalace_list_unextracted_drawers(limit=5)`. Expect 5 drawers (or fewer, if you've extracted some already) with content + metadata, plus a `total_unextracted` count.
+  2. After the Cowork scheduled task runs once: call `mempalace_kg_stats`. Expect `entities > 0` and `triples > 0`.
+  3. Re-call `mempalace_list_unextracted_drawers`: `total_unextracted` should have decreased by exactly the number of drawers the task processed.
+
+**Operator next step (recommended, no API key path):**
+  1. Cowork → scheduled tasks → Create scheduled task.
+  2. Interval: every 6 hours (or daily — your call).
+  3. Prompt: "Pull up to 50 unextracted drawers via mempalace_list_unextracted_drawers. For each one, read the content and extract subject-predicate-object triples using the v0.1 vocabulary [paste vocabulary]. Persist each triple via mempalace_kg_add(subject, predicate, object) with appropriate confidence and source_file=drawer:<id>. After all 50 are done, write a brief diary entry summarizing what you found."
+  4. Initial backfill: trigger the task on-demand a few times (or run it manually from a chat) to chew through the 1,636 existing drawers.
+
+**Rollback:** revert this commit. Tool disappears from the registry; existing triples remain (their `source_file` linkage is unchanged). The v6.0 API-key path is unaffected.

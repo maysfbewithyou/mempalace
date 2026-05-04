@@ -620,6 +620,94 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
 
 
+def tool_list_unextracted_drawers(limit: int = 50, since_date: str = None):
+    """List drawers that have no KG triples filed against them yet.
+
+    Used by the Cowork scheduled task that walks the palace using the
+    operator's Claude.ai subscription (subscription-side extraction —
+    bypasses the Anthropic API key path entirely).
+
+    Args:
+        limit: max drawers to return (1..200, default 50).
+        since_date: optional ISO date (YYYY-MM-DD); only return drawers whose
+            metadata.filed_at is on or after this date.
+
+    Returns:
+        {
+          "drawers": [
+            {drawer_id, content, wing, room, filed_at, source_file},
+            ...
+          ],
+          "returned": int,            # how many we returned (≤ limit)
+          "total_unextracted": int,   # how many remain unextracted overall
+          "limit": int,
+        }
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+
+    if since_date and not re.match(r"^\d{4}-\d{2}-\d{2}", since_date):
+        return {"error": "since_date must be ISO date YYYY-MM-DD"}
+
+    # KG drawer IDs that already have triples — skip these.
+    extracted = _kg.list_source_drawer_ids()
+
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+
+    drawers = []
+    total_unextracted = 0
+    offset = 0
+    batch_size = 500
+    try:
+        while True:
+            batch = col.get(
+                limit=batch_size,
+                offset=offset,
+                include=["documents", "metadatas"],
+            )
+            ids = batch.get("ids", []) or []
+            if not ids:
+                break
+            docs = batch.get("documents", []) or []
+            metas = batch.get("metadatas", []) or []
+            for i, did in enumerate(ids):
+                if did in extracted:
+                    continue
+                meta = metas[i] if i < len(metas) else {}
+                if since_date:
+                    filed_at = (meta or {}).get("filed_at", "") or ""
+                    if filed_at < since_date:
+                        continue
+                total_unextracted += 1
+                if len(drawers) < limit:
+                    drawers.append({
+                        "drawer_id": did,
+                        "content": docs[i] if i < len(docs) else "",
+                        "wing": (meta or {}).get("wing", ""),
+                        "room": (meta or {}).get("room", ""),
+                        "filed_at": (meta or {}).get("filed_at", ""),
+                        "source_file": (meta or {}).get("source_file", ""),
+                    })
+            offset += len(ids)
+            if len(ids) < batch_size:
+                break
+    except Exception as e:
+        logger.error(f"list_unextracted_drawers error: {e}")
+        return {"error": "Failed to walk palace"}
+
+    return {
+        "drawers": drawers,
+        "returned": len(drawers),
+        "total_unextracted": total_unextracted,
+        "limit": limit,
+    }
+
+
 def tool_kg_add(
     subject: str, predicate: str, object: str, valid_from: str = None, source_closet: str = None
 ):
@@ -835,6 +923,34 @@ TOOLS = {
         "description": "Full taxonomy: wing → room → drawer count",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_get_taxonomy,
+    },
+    "mempalace_list_unextracted_drawers": {
+        "description": (
+            "List drawers that have no KG triples filed against them yet. "
+            "Use this from a scheduled task (or interactively) to walk the "
+            "palace and extract triples from drawers that haven't been "
+            "processed. For each returned drawer, extract subject-predicate-"
+            "object triples using the v0.1 vocabulary, then persist each via "
+            "mempalace_kg_add(subject, predicate, object) — the source_file "
+            "linkage back to the drawer is bookkept automatically. "
+            "Returns up to `limit` drawers with their content, plus the total "
+            "count of unextracted drawers remaining so the caller knows when "
+            "the queue is empty."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Max drawers to return per call (1–200, default 50)",
+                },
+                "since_date": {
+                    "type": "string",
+                    "description": "Optional ISO date (YYYY-MM-DD); only return drawers filed on or after this date",
+                },
+            },
+        },
+        "handler": tool_list_unextracted_drawers,
     },
     "mempalace_get_aaak_spec": {
         "description": "Get the AAAK dialect specification — the compressed memory format MemPalace uses. Call this if you need to read or write AAAK-compressed memories.",

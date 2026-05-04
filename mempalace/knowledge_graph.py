@@ -342,6 +342,32 @@ class KnowledgeGraph:
             "relationship_types": predicates,
         }
 
+    # ── Drawer-source bookkeeping ─────────────────────────────────────────
+
+    def list_source_drawer_ids(self) -> set:
+        """Return the set of drawer IDs that already have at least one triple
+        attributed to them via source_file='drawer:<drawer_id>'.
+
+        Used by tool_list_unextracted_drawers (and the kg-backfill CLI) to
+        skip drawers that have already been processed without re-running
+        the (paid) extraction step on them.
+        """
+        prefix = "drawer:"
+        try:
+            rows = self._conn().execute(
+                "SELECT DISTINCT source_file FROM triples "
+                "WHERE source_file LIKE ?",
+                (prefix + "%",),
+            ).fetchall()
+        except Exception:
+            return set()
+        out = set()
+        for r in rows:
+            sf = r["source_file"] if r else None
+            if sf and sf.startswith(prefix):
+                out.add(sf[len(prefix):])
+        return out
+
     # ── Seed from known facts ─────────────────────────────────────────────
 
     def seed_from_entity_facts(self, entity_facts: dict):
