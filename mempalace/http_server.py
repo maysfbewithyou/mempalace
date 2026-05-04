@@ -1,6 +1,6 @@
 """HTTP transport wrapper for the MemPalace MCP server.
 
-version: 0.2
+version: 0.3
 phase: 2a (extended)
 locked architecture: MemPalace_Phase_2_Architecture_v0.2.md (A1–A8)
 
@@ -21,6 +21,18 @@ Version history:
           c) REQUEST_TIMEOUT_SECONDS default raised 30s -> 120s. ChromaDB
              cold-start (ONNX model load + first embedding) routinely
              exceeds 30s, which was triggering spurious restart loops.
+  0.3 — fix asyncio.LimitOverrunError on large search responses. The
+        StreamReader's default per-line limit is 64 KiB; search results
+        carrying full verbatim drawer content (long transcripts, multi-page
+        docs) routinely exceeded that and crashed the subprocess proxy.
+        Two changes (rollback to 0.2 by reverting this commit;
+        backwards-compatible):
+          a) create_subprocess_exec now passes limit=STDOUT_LINE_LIMIT
+             (default 10 MiB, env-tunable via MEMPALACE_STDOUT_LINE_LIMIT)
+             so single response lines up to that size round-trip cleanly.
+          b) _request_locked now catches asyncio.LimitOverrunError as a
+             distinct error class, logs it explicitly, restarts the
+             subprocess, and raises a clear RuntimeError to the caller.
 
 Purpose
 -------
@@ -166,6 +178,16 @@ HEALTH_TIMEOUT_SECONDS = float(os.environ.get("MEMPALACE_HEALTH_TIMEOUT", "5"))
 # corruption from a prior cancellation. The cap prevents a misbehaving
 # subprocess from spinning us forever.
 MAX_ORPHAN_RESPONSES = 16
+# Maximum bytes per JSON-RPC response line from the subprocess. The subprocess
+# emits line-delimited JSON and asyncio's StreamReader defaults to a 64 KiB
+# read limit; search results that include large verbatim drawer content
+# (long transcripts, multi-page docs) easily exceed that and trip
+# asyncio.LimitOverrunError. v0.3 raises the default to 10 MiB, which is
+# generous enough for any realistic palace search payload while still bounding
+# memory. Tunable via MEMPALACE_STDOUT_LINE_LIMIT for very-large-drawer cases.
+STDOUT_LINE_LIMIT = int(
+    os.environ.get("MEMPALACE_STDOUT_LINE_LIMIT", str(10 * 1024 * 1024))
+)
 
 
 # ── Bootstrap (A7) ───────────────────────────────────────────────────────────
@@ -251,6 +273,11 @@ class StdioProxy:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # v0.3: bump StreamReader buffer above the asyncio default 64 KiB.
+            # Search results carrying full verbatim drawer content can exceed
+            # 64 KiB on a single JSON-RPC line; without this raise, readline()
+            # raises asyncio.LimitOverrunError and the search call fails.
+            limit=STDOUT_LINE_LIMIT,
         )
         self._started_at = asyncio.get_event_loop().time()
         # Drain stderr in the background so it doesn't block the subprocess.
@@ -360,6 +387,23 @@ class StdioProxy:
                 )
                 await self._restart()
                 raise
+            except asyncio.LimitOverrunError as exc:
+                # v0.3: a single response line exceeded STDOUT_LINE_LIMIT bytes.
+                # Should never happen at the default 10 MiB unless a single
+                # drawer is enormous or many large drawers are crammed into
+                # one search result. Restart so the subprocess can't get
+                # stuck mid-line, and surface a clear error to the caller.
+                logger.error(
+                    "stdio_proxy: response line exceeded %d bytes (asyncio "
+                    "LimitOverrunError); restarting. Consider raising "
+                    "MEMPALACE_STDOUT_LINE_LIMIT.",
+                    STDOUT_LINE_LIMIT,
+                )
+                await self._restart()
+                raise RuntimeError(
+                    f"stdio_proxy: subprocess response line exceeded "
+                    f"{STDOUT_LINE_LIMIT}-byte limit"
+                ) from exc
 
             if not raw:
                 logger.error("stdio_proxy: subprocess EOF; restarting")

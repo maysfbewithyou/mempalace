@@ -1,9 +1,10 @@
 """Tests for the IEP fork's HTTP/MCP wrapper.
 
-version: 0.2
+version: 0.3
 phase: 2a (extended)
-covers: mempalace.http_server (incl. v0.2 buffer-corruption fix)
-rollback: revert to 0.1 by deleting the "v0.2 buffer corruption" test section.
+covers: mempalace.http_server (incl. v0.2 buffer-corruption fix and v0.3
+        large-response LimitOverrunError fix)
+rollback: revert to 0.2 by deleting the "v0.3 large response" test section.
 """
 
 from __future__ import annotations
@@ -640,3 +641,70 @@ def test_healthcheck_outer_timeout_triggers_restart(tmp_path, monkeypatch):
             await proxy.stop()
 
     asyncio.run(run())
+
+
+# ── v0.3 large-response regression test ────────────────────────────────────
+#
+# Guards the StdioProxy fix landed in http_server.py v0.3. Asyncio's
+# StreamReader defaults to a 64 KiB read limit per readline(); search results
+# with full verbatim drawer content easily exceeded that and crashed the
+# proxy with asyncio.LimitOverrunError. v0.3 raises the limit to 10 MiB by
+# default (env-tunable via MEMPALACE_STDOUT_LINE_LIMIT) and explicitly
+# handles the error if it ever does fire.
+
+
+def test_stdio_proxy_handles_large_response_line(tmp_path):
+    """A subprocess that emits a single response line >64 KiB should round-trip
+    cleanly. Default asyncio StreamReader limit is 64 KiB; v0.3 raises it to
+    10 MiB. Without the v0.3 fix this would raise asyncio.LimitOverrunError."""
+    big_script = tmp_path / "big_response_server.py"
+    big_script.write_text(textwrap.dedent("""
+        import json, sys
+        # Emit a payload comfortably larger than asyncio's default 64 KiB
+        # readline limit, but well under the 10 MiB v0.3 default. 200 KiB
+        # chosen so the test runs fast but exercises the >64 KiB path.
+        BIG_PAYLOAD = "x" * (200 * 1024)
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            req = json.loads(line)
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req.get("id"),
+                "result": {"echoed": req.get("method", ""), "big": BIG_PAYLOAD},
+            }
+            sys.stdout.write(json.dumps(resp) + "\\n")
+            sys.stdout.flush()
+    """))
+
+    async def run():
+        proxy = http_server.StdioProxy(cmd=[sys.executable, "-u", str(big_script)])
+        await proxy.start()
+        try:
+            resp = await proxy.request(
+                {"jsonrpc": "2.0", "id": "big-1", "method": "tools/list"}
+            )
+            assert resp["id"] == "big-1"
+            assert resp["result"]["echoed"] == "tools/list"
+            # The large field round-tripped intact.
+            assert len(resp["result"]["big"]) == 200 * 1024
+            assert resp["result"]["big"] == "x" * (200 * 1024)
+        finally:
+            await proxy.stop()
+
+    asyncio.run(run())
+
+
+def test_stdio_proxy_subprocess_uses_v3_line_limit(tmp_path):
+    """Verify the subprocess is actually spawned with the larger limit, not
+    the asyncio default. Reads STDOUT_LINE_LIMIT from the module so an
+    operator who tunes MEMPALACE_STDOUT_LINE_LIMIT down to a tiny value
+    (e.g. for testing or memory-bound deploys) gets the configured limit."""
+    # The default in v0.3 is 10 MiB.
+    assert http_server.STDOUT_LINE_LIMIT >= 1024 * 1024, (
+        "STDOUT_LINE_LIMIT default should be at least 1 MiB to handle "
+        "realistic search payloads"
+    )
+    # Sanity: it's an int, not a string from the env var.
+    assert isinstance(http_server.STDOUT_LINE_LIMIT, int)

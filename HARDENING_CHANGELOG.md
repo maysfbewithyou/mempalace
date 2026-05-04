@@ -313,3 +313,47 @@ The OAuth metadata at `/.well-known/oauth-authorization-server` advertised only 
 4. Tail the server log; on a successful rotation you'll see `oauth: rotated refresh_token (grant=refresh_token)`. On an attempted reuse you'll see `oauth: refresh_token reuse detected — rejecting`.
 
 **Rollback:** Revert this commit. The metadata change is backwards-compatible so clients keep working with `authorization_code` only — they'll just hit the expired-token problem again until reconnect.
+
+---
+
+## Version 5.0 — StdioProxy LimitOverrunError Fix on Large Search Responses (2026-05-04)
+
+Follow-up to V3.0 (StdioProxy buffer corruption) and V4.0 (OAuth refresh). With those two fixes deployed, MemPalace was healthy for `status`, `traverse`, `kg_query`, `kg_stats`, and `list_rooms` — but every call to `mempalace_search` returned a generic execution error. The Coolify logs traced it to `asyncio.LimitOverrunError` raised inside `StdioProxy._request_locked`. Pre-existing bug, exposed once everything else was working.
+
+Module version: `mempalace/http_server.py` 0.2 → 0.3. Test suite: `tests/test_http_server.py` 0.2 → 0.3. All 26 HTTP-wrapper tests pass (24 pre-existing + 2 new large-response regression tests).
+
+---
+
+### Fix 20: HIGH — `mempalace_search` Failing on Any Response > 64 KiB
+**File:** `mempalace/http_server.py` (MODIFIED — v0.2 → v0.3)
+**File:** `tests/test_http_server.py` (MODIFIED — v0.2 → v0.3)
+
+**Problem:** The MCP subprocess emits one JSON-RPC response per line of stdout. The proxy reads each response with `await proc.stdout.readline()`. Asyncio's `StreamReader` defaults to a per-line read limit of **64 KiB** (set when `create_subprocess_exec` constructs the reader without a `limit=` argument). Any response longer than that raises `asyncio.LimitOverrunError("Separator is found, but chunk is longer than limit")` and the proxy errors out the whole tool call.
+
+`mempalace_search` returns up to `limit` (default 5) drawer hits, *each including the verbatim drawer content*. A single mid-sized drawer (a long conversation transcript, a multi-page document) plus JSON envelope easily exceeded 64 KiB on its own, and any combination of multiple results made it certain. The bug was masked before V3.0/V4.0 because the proxy was already crashing for other reasons; once those were fixed, this became the dominant failure mode for the search path specifically.
+
+The error trace from production confirmed the exact location:
+
+```
+asyncio.exceptions.LimitOverrunError: Separator is found, but chunk is longer than limit
+File "/venv/lib/python3.12/site-packages/mempalace/http_server.py", line 297, in request
+```
+
+**Solution:** Two-line code change plus explicit error handling:
+
+  1. **Pass `limit=STDOUT_LINE_LIMIT` to `create_subprocess_exec`.** The new module-level `STDOUT_LINE_LIMIT` constant defaults to **10 MiB** (`10 * 1024 * 1024`), tunable via the `MEMPALACE_STDOUT_LINE_LIMIT` env var. This is large enough to handle any realistic palace search payload while still bounding memory in the worst case.
+
+  2. **Catch `asyncio.LimitOverrunError` in `_request_locked`** as a distinct exception. If a single response line ever exceeds even the 10 MiB ceiling, the proxy logs the size, restarts the subprocess to clear any partial state, and raises a clear `RuntimeError` to the HTTP caller (instead of leaking the asyncio-internal exception name into the MCP error path).
+
+  3. **New tests in `tests/test_http_server.py`:** `test_stdio_proxy_handles_large_response_line` spawns a fake subprocess that emits a 200 KiB response (well over the 64 KiB asyncio default but well under the new 10 MiB limit) and verifies the payload round-trips intact. `test_stdio_proxy_subprocess_uses_v3_line_limit` guards against accidentally regressing the constant below 1 MiB.
+
+**Breaking changes:** None. Behavior is strictly additive — responses that fit under 64 KiB before still work; responses that exceeded 64 KiB now also work. The new env var is optional.
+
+**Operational changes:** Memory ceiling per in-flight request is now bounded by `STDOUT_LINE_LIMIT` (10 MiB by default) rather than asyncio's hidden 64 KiB. With single-uvicorn-worker (A4) this is one buffer at a time. If a deploy is memory-bound (very small VM), set `MEMPALACE_STDOUT_LINE_LIMIT=2097152` (2 MiB) or similar — search may fail on truly massive results but the per-request memory footprint stays small.
+
+**How to test:**
+  1. After redeploy, run `mempalace_search query="anything" limit=5` from the MemPalace connector. With a populated palace, this previously errored; with v0.3 it returns the expected hit list.
+  2. Run `pytest tests/test_http_server.py -v` — 26/26 should pass, including the two new v0.3 tests.
+  3. Tail server logs while exercising search. With v0.3 you should see no `LimitOverrunError` mentions in normal operation. If one does appear (>10 MiB single response), it's now a clearly logged and recovered-from event rather than a session-corrupting crash.
+
+**Rollback:** Revert this commit. If deployed, search fails again on any response > 64 KiB — but no other tools regress.
