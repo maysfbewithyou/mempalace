@@ -346,7 +346,17 @@ class KnowledgeGraph:
 
     def list_source_drawer_ids(self) -> set:
         """Return the set of drawer IDs that already have at least one triple
-        attributed to them via source_file='drawer:<drawer_id>'.
+        attributed to them via either source_file='drawer:<drawer_id>' OR
+        source_closet='drawer:<drawer_id>'.
+
+        Both columns are inspected because triples enter the KG via two
+        different paths that historically wrote different columns:
+          - tool_add_drawer auto-extract and kg_backfill.py write source_file
+          - tool_kg_add (the MCP tool callers use during scheduled extraction
+            runs) writes source_closet
+        Reading only one column made every kg_add-extracted drawer look
+        unextracted (see fix in v3.0.14+iep.3 — "fix: bookkeep drawer
+        extraction state in list_unextracted_drawers").
 
         Used by tool_list_unextracted_drawers (and the kg-backfill CLI) to
         skip drawers that have already been processed without re-running
@@ -355,15 +365,20 @@ class KnowledgeGraph:
         prefix = "drawer:"
         try:
             rows = self._conn().execute(
-                "SELECT DISTINCT source_file FROM triples "
-                "WHERE source_file LIKE ?",
-                (prefix + "%",),
+                """
+                SELECT DISTINCT src FROM (
+                    SELECT source_file   AS src FROM triples WHERE source_file   LIKE ?
+                    UNION
+                    SELECT source_closet AS src FROM triples WHERE source_closet LIKE ?
+                )
+                """,
+                (prefix + "%", prefix + "%"),
             ).fetchall()
         except Exception:
             return set()
         out = set()
         for r in rows:
-            sf = r["source_file"] if r else None
+            sf = r["src"] if r else None
             if sf and sf.startswith(prefix):
                 out.add(sf[len(prefix):])
         return out

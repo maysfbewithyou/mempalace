@@ -354,6 +354,50 @@ class TestKGTools:
         result = tool_kg_stats()
         assert result["entities"] >= 4
 
+    def test_kg_add_marks_drawer_as_extracted(self, monkeypatch, kg):
+        """Regression for v3.0.14+iep.3: a triple filed via tool_kg_add
+        with source_closet='drawer:<id>' must mark that drawer as
+        extracted when seen by KnowledgeGraph.list_source_drawer_ids()
+        (the predicate that drives tool_list_unextracted_drawers).
+
+        Before the fix, list_source_drawer_ids() only looked at the
+        source_file column, so triples written via tool_kg_add (which
+        only writes source_closet) were invisible and every drawer
+        stayed marked as unextracted forever.
+
+        Note: this test deliberately does NOT call tool_list_unextracted_drawers
+        end-to-end — that would require ChromaDB and its embedding-model
+        download (~80 MB) which is environment-flaky and not needed to
+        exercise the bug. The bug is in the SQLite-side predicate; the
+        chromadb scan in list_unextracted_drawers is just an enumerator.
+        See TestDrawerSourceBookkeeping in test_knowledge_graph.py for
+        the underlying coverage.
+        """
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_kg", kg)
+        from mempalace.mcp_server import tool_kg_add
+
+        drawer_id = "drawer_bookkeep_wing_bookkeep_room_aaaa1111bbbb2222"
+
+        # Sanity precondition — fresh KG, drawer not extracted.
+        assert drawer_id not in kg.list_source_drawer_ids()
+
+        # Single kg_add with source_closet='drawer:<id>' (the format the
+        # tool description tells callers to use).
+        kg_result = tool_kg_add(
+            subject="Alice",
+            predicate="loves",
+            object="espresso",
+            source_closet=f"drawer:{drawer_id}",
+        )
+        assert kg_result["success"] is True
+
+        # After kg_add: bookkeeping predicate must report this drawer as
+        # extracted. This is exactly what tool_list_unextracted_drawers
+        # consults to decide which drawers to filter out of its return.
+        assert drawer_id in kg.list_source_drawer_ids()
+
 
 # ── Diary Tools ─────────────────────────────────────────────────────────
 

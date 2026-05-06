@@ -137,3 +137,51 @@ class TestStats:
         assert stats["triples"] == 5
         assert stats["current_facts"] == 4  # 1 expired (Acme Corp)
         assert stats["expired_facts"] == 1
+
+
+class TestDrawerSourceBookkeeping:
+    """Regression tests for v3.0.14+iep.3:
+    list_source_drawer_ids must inspect BOTH source_file and source_closet
+    so triples filed via tool_kg_add (which writes source_closet) count
+    the underlying drawer as extracted in tool_list_unextracted_drawers.
+    """
+
+    def test_source_file_path_bookkeeps(self, kg):
+        # Path A: triples written with source_file (auto-extract / backfill)
+        kg.add_triple(
+            "Alice", "knows", "Bob", source_file="drawer:drawer_wing_a_room_x_aaaa1111"
+        )
+        ids = kg.list_source_drawer_ids()
+        assert "drawer_wing_a_room_x_aaaa1111" in ids
+
+    def test_source_closet_path_bookkeeps(self, kg):
+        # Path B: triples written with source_closet (the kg_add MCP tool path
+        # — this was the broken case before v3.0.14+iep.3).
+        kg.add_triple(
+            "Alice", "knows", "Bob", source_closet="drawer:drawer_wing_b_room_y_bbbb2222"
+        )
+        ids = kg.list_source_drawer_ids()
+        assert "drawer_wing_b_room_y_bbbb2222" in ids
+
+    def test_both_columns_unioned(self, kg):
+        kg.add_triple(
+            "A", "knows", "B", source_file="drawer:from_file_path_cccc3333"
+        )
+        kg.add_triple(
+            "C", "knows", "D", source_closet="drawer:from_closet_path_dddd4444"
+        )
+        ids = kg.list_source_drawer_ids()
+        assert "from_file_path_cccc3333" in ids
+        assert "from_closet_path_dddd4444" in ids
+
+    def test_non_drawer_prefixes_ignored(self, kg):
+        kg.add_triple("E", "knows", "F", source_closet="closet:not_a_drawer")
+        kg.add_triple("G", "knows", "H", source_file="file:/some/path.md")
+        ids = kg.list_source_drawer_ids()
+        assert ids == set()
+
+    def test_null_source_columns_safe(self, kg):
+        # Triples with both columns NULL must not raise and must not show up.
+        kg.add_triple("I", "knows", "J")
+        ids = kg.list_source_drawer_ids()
+        assert ids == set()

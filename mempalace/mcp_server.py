@@ -931,8 +931,10 @@ TOOLS = {
             "palace and extract triples from drawers that haven't been "
             "processed. For each returned drawer, extract subject-predicate-"
             "object triples using the v0.1 vocabulary, then persist each via "
-            "mempalace_kg_add(subject, predicate, object) — the source_file "
-            "linkage back to the drawer is bookkept automatically. "
+            "mempalace_kg_add(subject, predicate, object, "
+            "source_closet='drawer:<drawer_id>'). The drawer back-link is NOT "
+            "automatic — you MUST pass source_closet='drawer:<drawer_id>' for "
+            "the drawer to count as extracted on the next call to this tool. "
             "Returns up to `limit` drawers with their content, plus the total "
             "count of unextracted drawers remaining so the caller knows when "
             "the queue is empty."
@@ -996,7 +998,12 @@ TOOLS = {
                 },
                 "source_closet": {
                     "type": "string",
-                    "description": "Closet ID where this fact appears (optional)",
+                    "description": (
+                        "Source link back to where this fact came from "
+                        "(optional). For drawer-extraction workflows pass "
+                        "'drawer:<drawer_id>' so the drawer counts as "
+                        "extracted in mempalace_list_unextracted_drawers."
+                    ),
                 },
             },
             "required": ["subject", "predicate", "object"],

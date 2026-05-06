@@ -524,3 +524,55 @@ Both paths share the same `source_file=drawer:<id>` linkage, so a triple's drawe
   4. Initial backfill: trigger the task on-demand a few times (or run it manually from a chat) to chew through the 1,636 existing drawers.
 
 **Rollback:** revert this commit. Tool disappears from the registry; existing triples remain (their `source_file` linkage is unchanged). The v6.0 API-key path is unaffected.
+
+---
+
+## Version 6.2 — Drawer Extraction Bookkeeping Fix (2026-05-05)
+
+Follow-up to Fix 25 (`mempalace_list_unextracted_drawers`). Operator reported that the queue never drained: every drawer kept showing up as unextracted even after dozens of `kg_add` triples landed against specific drawer IDs. Diagnosed as a column-mismatch bug; fix is small and targeted.
+
+---
+
+### Fix 26: Bookkeep drawer extraction state across both source columns
+
+**File:** `mempalace/knowledge_graph.py` (MODIFIED — `list_source_drawer_ids`)
+**File:** `mempalace/mcp_server.py` (MODIFIED — tool descriptions for `mempalace_list_unextracted_drawers` and `mempalace_kg_add.source_closet`)
+**File:** `tests/test_knowledge_graph.py` (NEW — `TestDrawerSourceBookkeeping` class)
+**File:** `tests/test_mcp_server.py` (NEW — `test_kg_add_marks_drawer_as_extracted`)
+**File:** `scripts/verify_drawer_bookkeeping_fix.py` (NEW — standalone verifier, no chromadb)
+**File:** `scripts/backfill_drawer_extraction_state.py` (NEW — optional one-shot data-normalization, dry-run by default)
+
+**Problem:** The `triples` table has two source-link columns: `source_file` and `source_closet`. Triples written by `tool_add_drawer`'s auto-extract hook and by `kg_backfill.py` set `source_file='drawer:<id>'`. Triples written by `tool_kg_add` (the MCP tool the scheduled-task Claude calls) set `source_closet='drawer:<id>'` — `source_file` is never populated by that path. `list_source_drawer_ids()` only inspected `source_file`, so every triple that came in via `kg_add` was invisible to the bookkeeping query and the underlying drawer stayed marked as unextracted forever.
+
+Symptoms (reported on 2026-05-05): `mempalace_status` reports 1638 drawers, `mempalace_list_unextracted_drawers` reports 1638 unextracted; ~70 `kg_add` triples filed across ~30 drawers, every triple confirmed in `kg_query` results — yet none of those 30 drawers ever drop from the unextracted list.
+
+**Solution:** Change the query in `KnowledgeGraph.list_source_drawer_ids()` to UNION both columns:
+
+```sql
+SELECT DISTINCT src FROM (
+    SELECT source_file   AS src FROM triples WHERE source_file   LIKE 'drawer:%'
+    UNION
+    SELECT source_closet AS src FROM triples WHERE source_closet LIKE 'drawer:%'
+)
+```
+
+A drawer counts as extracted if EITHER column on any of its triples points back to it. This preserves the existing `source_file` flow that auto-extract and `kg_backfill.py` rely on, AND captures the `source_closet` triples written by `tool_kg_add` calls. Smaller change than retrofitting `kg_add` to write both columns, and instantly counts every triple already in the database during the broken window — no schema change, no row updates.
+
+Tool descriptions also corrected:
+
+  - `mempalace_list_unextracted_drawers`: dropped the misleading "the source_file linkage back to the drawer is bookkept automatically" line; replaced with explicit guidance that the caller MUST pass `source_closet='drawer:<drawer_id>'` to `kg_add`.
+  - `mempalace_kg_add.source_closet`: parameter description now says "for drawer-extraction workflows pass `drawer:<drawer_id>` so the drawer counts as extracted in `mempalace_list_unextracted_drawers`."
+
+Version aligned: `mempalace/version.py` was drifting at `3.0.14` while `pyproject.toml` was at `3.0.14+iep.2`. Both bumped to `3.0.14+iep.3` so `test_version_consistency.py` continues to pass.
+
+**Breaking changes:** None. Pure read-side fix; no schema change, no data change. Existing triples filed via either path continue to work.
+
+**How to test:**
+  1. Clean palace: file a drawer via `tool_add_drawer`, confirm it appears in `mempalace_list_unextracted_drawers`.
+  2. Call `mempalace_kg_add(subject, predicate, object, source_closet='drawer:<id>')` against that drawer.
+  3. Re-call `mempalace_list_unextracted_drawers` — `total_unextracted` should decrement by 1 and the drawer should NOT be in the returned list.
+  4. Existing data: just re-call `mempalace_list_unextracted_drawers` after deploy. The ~30 drawers with `kg_add`-filed triples from the broken window should now drop from the queue immediately, no script needed.
+
+**Optional data-normalization:** `scripts/backfill_drawer_extraction_state.py` copies `drawer:<id>` values between `source_file` and `source_closet` whenever one is NULL, so a future tool that reads only one column doesn't have the same blind spot. Dry-run by default; `--apply` to commit. Not required for the fix — the union query already handles the visible bug.
+
+**Rollback:** revert this commit. The query goes back to single-column inspection and the bug returns. Triples in the database (including any normalized by the backfill script) remain valid; both columns are non-destructive.
