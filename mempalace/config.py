@@ -11,16 +11,42 @@ from pathlib import Path
 
 
 # ── Input validation ──────────────────────────────────────────────────────────
-# Shared sanitizers for wing/room/entity names. Prevents path traversal,
-# excessively long strings, and special characters that could cause issues
-# in file paths, SQLite, or ChromaDB metadata.
+# Two sanitizers, intentionally split:
+#
+#   sanitize_name   — strict; for filesystem-adjacent fields (wing, room,
+#                     agent_name) and controlled-vocabulary fields (predicate).
+#                     Blocks /, \, :, and most punctuation.
+#
+#   sanitize_entity — permissive; for KG subject/object and the `entity`
+#                     argument of kg_query / kg_timeline. These are
+#                     user-supplied identifiers (file paths, URLs, host:port
+#                     endpoints, SHAs, version strings) where the strict
+#                     character set silently dropped real fidelity.
+#                     Still blocks null bytes, control characters, path
+#                     traversal (..), and excessive length.
+#
+# Why two sanitizers instead of one relaxed one: wing/room values flow into
+# filesystem paths and ChromaDB collection metadata where slashes and colons
+# are genuinely unsafe. KG subject/object values flow into SQLite text
+# columns where they are not interpreted as paths — they're just identifiers.
 
 MAX_NAME_LENGTH = 128
+MAX_ENTITY_LENGTH = 256
+
 _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_ .'-]{0,126}[a-zA-Z0-9]?$")
+# Control characters: 0x00-0x1F (incl. tab/newline/cr) and 0x7F (DEL).
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1F\x7F]")
 
 
 def sanitize_name(value: str, field_name: str = "name") -> str:
-    """Validate and sanitize a wing/room/entity name.
+    """Validate and sanitize a wing/room/agent name or KG predicate.
+
+    Strict alphabet — blocks slashes, colons, and most punctuation. Use this
+    for any field that flows into a filesystem path, ChromaDB collection
+    metadata, or a controlled-vocabulary slot like a predicate.
+
+    For KG subject/object values (which legitimately contain URLs, paths,
+    host:port endpoints, etc.), use ``sanitize_entity`` instead.
 
     Raises ValueError if the name is invalid.
     """
@@ -43,6 +69,51 @@ def sanitize_name(value: str, field_name: str = "name") -> str:
     # Enforce safe character set
     if not _SAFE_NAME_RE.match(value):
         raise ValueError(f"{field_name} contains invalid characters")
+
+    return value
+
+
+def sanitize_entity(value: str, field_name: str = "entity") -> str:
+    """Validate and sanitize a KG entity value (subject or object).
+
+    Permissive — accepts URLs, file paths, host:port pairs, SHAs, version
+    strings, and other real-world identifiers. Slashes, backslashes, and
+    colons are all allowed because these values are stored as opaque text
+    in SQLite and are not interpreted as filesystem paths.
+
+    Still blocks the things that actually matter:
+      - Null bytes (SQL/text safety)
+      - Control characters (display/log injection safety)
+      - Path traversal sequences (`..`) (defense in depth)
+      - Excessive length (DoS / index bloat)
+
+    Use this for the ``subject`` and ``object`` arguments of ``kg_add`` and
+    ``kg_invalidate``, and the ``entity`` argument of ``kg_query`` /
+    ``kg_timeline``. For wing names, room names, agent names, and KG
+    predicates, use ``sanitize_name`` instead.
+
+    Raises ValueError if the value is invalid.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+
+    value = value.strip()
+
+    if len(value) > MAX_ENTITY_LENGTH:
+        raise ValueError(
+            f"{field_name} exceeds maximum length of {MAX_ENTITY_LENGTH} characters"
+        )
+
+    # Block path traversal — ".." has no legitimate role in an entity
+    # identifier and reliably indicates either an injection attempt or a
+    # bug in the caller.
+    if ".." in value:
+        raise ValueError(f"{field_name} contains '..' which is not allowed")
+
+    # Block null bytes and control characters (covers \x00, tab, newline, CR,
+    # and DEL — none of these belong in an identifier).
+    if _CONTROL_CHARS_RE.search(value):
+        raise ValueError(f"{field_name} contains control characters")
 
     return value
 

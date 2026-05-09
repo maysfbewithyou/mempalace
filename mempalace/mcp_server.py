@@ -28,7 +28,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .config import MempalaceConfig, sanitize_name, sanitize_content
+from .config import MempalaceConfig, sanitize_name, sanitize_entity, sanitize_content
 from .version import __version__
 from .searcher import search_memories
 from .query_sanitizer import sanitize_query
@@ -609,7 +609,9 @@ def tool_delete_drawer(drawer_id: str):
 def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     """Query the knowledge graph for an entity's relationships."""
     try:
-        entity = sanitize_name(entity, "entity")
+        # Permissive validator — entities may legitimately be URLs, paths, or
+        # host:port endpoints. See config.sanitize_entity.
+        entity = sanitize_entity(entity, "entity")
     except ValueError as e:
         return {"error": str(e)}
     if as_of and not re.match(r"^\d{4}-\d{2}-\d{2}$", as_of):
@@ -713,9 +715,13 @@ def tool_kg_add(
 ):
     """Add a relationship to the knowledge graph."""
     try:
-        subject = sanitize_name(subject, "subject")
+        # Subject/object are user-supplied identifiers — permissive validator
+        # so URLs, paths, and host:port endpoints round-trip cleanly.
+        # Predicate stays strict — it's a snake_case slot from a controlled
+        # vocabulary (member_of, deployed_at, etc.).
+        subject = sanitize_entity(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
-        object = sanitize_name(object, "object")
+        object = sanitize_entity(object, "object")
     except ValueError as e:
         return {"success": False, "error": str(e)}
     if valid_from and not re.match(r"^\d{4}-\d{2}-\d{2}$", valid_from):
@@ -740,9 +746,11 @@ def tool_kg_add(
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
     """Mark a fact as no longer true (set end date)."""
     try:
-        subject = sanitize_name(subject, "subject")
+        # Same alphabet rules as kg_add — permissive on subject/object,
+        # strict on predicate.
+        subject = sanitize_entity(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
-        object = sanitize_name(object, "object")
+        object = sanitize_entity(object, "object")
     except ValueError as e:
         return {"success": False, "error": str(e)}
     if ended and not re.match(r"^\d{4}-\d{2}-\d{2}$", ended):
@@ -763,7 +771,9 @@ def tool_kg_timeline(entity: str = None):
     """Get chronological timeline of facts, optionally for one entity."""
     if entity:
         try:
-            entity = sanitize_name(entity, "entity")
+            # Permissive validator to match kg_query / kg_add — users must
+            # be able to query for entities they were able to file.
+            entity = sanitize_entity(entity, "entity")
         except ValueError as e:
             return {"error": str(e)}
     results = _kg.timeline(entity)

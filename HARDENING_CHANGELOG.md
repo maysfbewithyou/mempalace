@@ -576,3 +576,81 @@ Version aligned: `mempalace/version.py` was drifting at `3.0.14` while `pyprojec
 **Optional data-normalization:** `scripts/backfill_drawer_extraction_state.py` copies `drawer:<id>` values between `source_file` and `source_closet` whenever one is NULL, so a future tool that reads only one column doesn't have the same blind spot. Dry-run by default; `--apply` to commit. Not required for the fix — the union query already handles the visible bug.
 
 **Rollback:** revert this commit. The query goes back to single-column inspection and the bug returns. Triples in the database (including any normalized by the backfill script) remain valid; both columns are non-destructive.
+
+---
+
+## Version 6.3 — KG Entity Sanitizer Bifurcation (2026-05-09)
+
+Targeted fix to recover real fidelity loss in the KG. The `sanitize_name` validator was being applied uniformly to every user-supplied string the MCP layer accepts — including KG `subject` / `object` / `entity` values, which legitimately need to hold file paths, URLs, host:port endpoints, repo refs, and version strings. The strict alphabet silently dropped those facts. Surfaced by the 2026-05-09 audit of the `mempalace-kg-extraction` scheduled task.
+
+This is also a follow-up of sorts to Fix 13 (Knowledge Graph Sanitization Gap, Version 2.0) — that fix correctly closed the read-side hole by applying *some* sanitizer everywhere; this fix corrects which sanitizer is appropriate for KG entity values.
+
+---
+
+### Fix 27: KG Entity Validator Was Rejecting Real Identifiers
+
+**File:** `mempalace/config.py` (MODIFIED — added `sanitize_entity`)
+**File:** `mempalace/mcp_server.py` (MODIFIED — `tool_kg_add`, `tool_kg_invalidate`, `tool_kg_query`, `tool_kg_timeline` switched to permissive validator on subject/object/entity; predicate kept strict)
+**File:** `tests/test_security_hardening.py` (NEW — `TestSanitizeEntity` class, 18 cases + 2 regression tests)
+**File:** `pyproject.toml` + `mempalace/version.py` (bump `3.0.14+iep.3` → `3.0.14+iep.4`)
+
+**Problem:** `sanitize_name`'s alphabet is `^[a-zA-Z0-9][a-zA-Z0-9_ .'-]{0,126}[a-zA-Z0-9]?$`. That makes sense for wing/room/agent names that flow into filesystem paths and ChromaDB collection metadata, and for the snake_case predicate vocabulary. It does NOT make sense for KG `subject` / `object` / `entity` values, which are user-supplied identifiers. The strict validator rejected:
+
+  - URLs: `https://github.com/Interact-Event-Productions/atlas` (contains `:` and `/`)
+  - Windows paths: `C:\Users\phatt\Documents\GitHub\atlas` (contains `:` and `\`)
+  - Unix paths: `/etc/hosts` (starts with `/`)
+  - Host:port: `10.0.0.1:2224` (contains `:`)
+  - Email-like: `matt@example.com` (contains `@`)
+  - Git refs: `feature/sales-app-improvements` (contains `/`)
+
+The 2026-05-09 audit of a single 50-drawer extraction batch found the v1.0 extractor had silently dropped at least three classes of identifiers (host:port, Windows path, repo URL) because the rejection forced it to either skip the fact or sanitize the entity into a lossy form (slash → space, dropping TLDs).
+
+A client-side workaround attempt (URL-encoding `/` `\` `:` to `%2F` `%5C` `%3A`) failed because `%` is also outside the strict alphabet. The strict alphabet permits only alnum, `.`, `-`, `_`, space, and `'` — no pure client-side encoding can round-trip through it.
+
+**Solution:** Bifurcate the sanitizer. Add `sanitize_entity` in `config.py` for KG entity values; keep `sanitize_name` unchanged for filesystem-adjacent and vocabulary fields.
+
+`sanitize_entity` preserves every guarantee that actually matters for security or storage integrity:
+
+  - Rejects empty / whitespace-only input
+  - Rejects null bytes
+  - Rejects control characters (0x00-0x1F, 0x7F) — covers tab, newline, CR
+  - Rejects path traversal (`..`)
+  - Rejects strings longer than 256 chars (was 128 for `sanitize_name`; bumped because URLs are routinely longer)
+
+It does NOT restrict the printable character set — a KG entity value is opaque text in a SQLite column, not a filesystem path or a collection metadata key, so allowing `/`, `\`, `:`, `@`, `?`, `=`, `&`, etc. is safe.
+
+`sanitize_entity` is now used at:
+
+  - `tool_kg_add` — `subject`, `object` parameters (predicate stays strict)
+  - `tool_kg_invalidate` — `subject`, `object` parameters (predicate stays strict)
+  - `tool_kg_query` — `entity` parameter
+  - `tool_kg_timeline` — `entity` parameter
+
+`sanitize_name` is unchanged and remains in use for:
+
+  - `wing`, `room`, `start_room`, `wing_a`, `wing_b` (filesystem-adjacent)
+  - `agent_name` (filesystem-adjacent — diary wing is `wing_<agent_name>`)
+  - `predicate` (controlled snake_case vocabulary, must stay constrained)
+
+**Why this isn't a security regression:** The only thing the strict character set bought beyond what `sanitize_entity` enforces was rejecting "unusual but harmless" punctuation in identifiers. None of `/`, `\`, `:`, `@`, `?`, `=`, `&` is special to SQLite text columns or ChromaDB metadata values when stored as opaque strings. They were never special — they were just disallowed. Path traversal (`..`), null bytes, and control characters — the actual attack vectors — are still blocked.
+
+**Breaking changes:** None for existing data. Strings that passed the old validator still pass `sanitize_entity`. Strings that previously failed (URLs, paths, etc.) now succeed.
+
+**Test coverage:** New `TestSanitizeEntity` class in `tests/test_security_hardening.py`:
+
+  - 10 should-accept tests: `https://`, Unix path, Windows path, host:port, repo path, version string, email-like, query string, surrounding-whitespace strip, simple identifier
+  - 8 should-reject tests: empty, whitespace-only, null byte, path traversal, path traversal inside URL, newline, tab, length > 256
+  - 1 should-reject test for non-string input
+  - 2 regression tests confirming `sanitize_name` is still strict (slash and colon both still rejected)
+
+All 21 cases pass against the new validator; 2 regression cases pass to confirm `sanitize_name` is unchanged.
+
+**How to test against a deployed server:**
+
+  1. Call `mempalace_kg_add(subject="atlas", predicate="references", object="https://github.com/Interact-Event-Productions/atlas")` — should return `success: true`. Before this fix it returned `object contains invalid characters`.
+  2. Call `mempalace_kg_query(entity="https://github.com/Interact-Event-Productions/atlas")` — should return the triple from step 1.
+  3. Confirm `sanitize_name`-protected fields still reject: `mempalace_add_drawer(wing="wing/with/slashes", ...)` should still error with `wing contains invalid path characters`.
+
+**Follow-up — scheduled task SKILL.md:** the v1.1 SKILL.md for `mempalace-kg-extraction` (deployed 2026-05-08) currently instructs the extractor to URL-encode path/URL/host:port entities — which was wrong because `%` is also rejected. Once this fix deploys, that SKILL.md should be superseded by a v1.2 that drops the encoding step entirely and instructs the extractor to file these identifiers as raw strings.
+
+**Rollback:** revert this commit. `sanitize_name` snaps back into use everywhere it was used before, and the rejection behavior returns. Triples already filed via `sanitize_entity`'s permissive set will remain in the database (they're valid SQLite/ChromaDB strings) but new attempts to file similar values will fail again.

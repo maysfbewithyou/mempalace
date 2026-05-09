@@ -22,7 +22,7 @@ from pathlib import Path
 
 # Import modules under test
 from mempalace.query_sanitizer import sanitize_query
-from mempalace.config import sanitize_name
+from mempalace.config import sanitize_name, sanitize_entity
 from mempalace.mcp_server import (
     RateLimiter,
     _paginated_get_metadatas,
@@ -492,6 +492,109 @@ class TestToolErrorSanitization:
         result = tool_list_wings()
 
         assert "error" in result or "hint" in result
+
+
+# ============================================================================
+# KG ENTITY SANITIZER TESTS (sanitize_entity)
+# ============================================================================
+
+
+class TestSanitizeEntity:
+    """Test the permissive sanitizer used for KG subject/object values.
+
+    sanitize_entity replaced sanitize_name on the KG add/invalidate/query
+    code paths so that real-world identifiers (URLs, file paths, host:port
+    endpoints, version strings) round-trip cleanly. Path-traversal, null
+    bytes, and control characters are still blocked.
+    """
+
+    # --- Should accept ---
+
+    def test_accepts_url_with_https_scheme(self):
+        """URLs with :// must round-trip — they were rejected by sanitize_name."""
+        assert sanitize_entity("https://github.com/IEP/atlas") == "https://github.com/IEP/atlas"
+
+    def test_accepts_unix_path(self):
+        assert sanitize_entity("/etc/hosts") == "/etc/hosts"
+
+    def test_accepts_windows_path(self):
+        assert sanitize_entity(r"C:\Users\phatt\GitHub\atlas") == r"C:\Users\phatt\GitHub\atlas"
+
+    def test_accepts_host_port(self):
+        assert sanitize_entity("10.0.0.1:2224") == "10.0.0.1:2224"
+
+    def test_accepts_repo_path(self):
+        assert sanitize_entity("github.com/Interact-Event-Productions/atlas") == \
+            "github.com/Interact-Event-Productions/atlas"
+
+    def test_accepts_version_string(self):
+        assert sanitize_entity("v4.0.0-beta.470") == "v4.0.0-beta.470"
+
+    def test_accepts_email_like(self):
+        # @ and . are fine
+        assert sanitize_entity("matt@example.com") == "matt@example.com"
+
+    def test_accepts_query_string(self):
+        # ? & = should all pass
+        assert sanitize_entity("https://x.com/q?a=1&b=2") == "https://x.com/q?a=1&b=2"
+
+    def test_strips_surrounding_whitespace(self):
+        assert sanitize_entity("  atlas  ") == "atlas"
+
+    def test_accepts_short_simple_identifier(self):
+        # Continues to accept what sanitize_name accepted
+        assert sanitize_entity("Atlas") == "Atlas"
+
+    # --- Should reject ---
+
+    def test_rejects_empty_string(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            sanitize_entity("")
+
+    def test_rejects_whitespace_only(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            sanitize_entity("   ")
+
+    def test_rejects_null_byte(self):
+        with pytest.raises(ValueError, match="control characters"):
+            sanitize_entity("atlas\x00injection")
+
+    def test_rejects_path_traversal(self):
+        with pytest.raises(ValueError, match=r"\.\."):
+            sanitize_entity("../etc/passwd")
+
+    def test_rejects_path_traversal_inside_url(self):
+        with pytest.raises(ValueError, match=r"\.\."):
+            sanitize_entity("https://x.com/foo/../bar")
+
+    def test_rejects_newline(self):
+        with pytest.raises(ValueError, match="control characters"):
+            sanitize_entity("atlas\nrepo")
+
+    def test_rejects_tab(self):
+        with pytest.raises(ValueError, match="control characters"):
+            sanitize_entity("atlas\trepo")
+
+    def test_rejects_excessive_length(self):
+        with pytest.raises(ValueError, match="exceeds maximum length"):
+            sanitize_entity("x" * 257)
+
+    def test_rejects_non_string(self):
+        with pytest.raises(ValueError):
+            sanitize_entity(None)
+        with pytest.raises(ValueError):
+            sanitize_entity(12345)
+
+    # --- Sanitize_name still strict (regression check) ---
+
+    def test_sanitize_name_still_rejects_slash(self):
+        """The bifurcation must not loosen sanitize_name itself."""
+        with pytest.raises(ValueError, match="invalid path characters"):
+            sanitize_name("https://github.com")
+
+    def test_sanitize_name_still_rejects_colon(self):
+        with pytest.raises(ValueError, match="invalid characters"):
+            sanitize_name("host:port")
 
 
 if __name__ == "__main__":
