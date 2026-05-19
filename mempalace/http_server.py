@@ -100,6 +100,14 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
 from .config import MempalaceConfig
+from .continuous_capture import (
+    activity as cc_activity,
+    beacon as cc_beacon,
+    db as cc_db,
+    heartbeat as cc_heartbeat,
+    routes as cc_routes,
+    sweeper as cc_sweeper,
+)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 # stdout for app logs (Coolify catches and ships); structured-JSON is a Phase 8+
@@ -493,6 +501,13 @@ class StdioProxy:
 # ── Module-level singletons ──────────────────────────────────────────────────
 # Created in lifespan; referenced by route handlers and middleware.
 _proxy: StdioProxy | None = None
+# Continuous-capture sweeper (Phase 1A v0.1.1.0). Background asyncio task
+# started in lifespan; cancelled on graceful shutdown. None until lifespan runs.
+_cc_sweeper_task: "asyncio.Task | None" = None
+# Phase 1B (v0.1.2.0) — beacon worker task
+_cc_beacon_task: "asyncio.Task | None" = None
+# Phase 1C (v0.1.3.0) — dead-thread detector task
+_cc_dead_detect_task: "asyncio.Task | None" = None
 
 
 def _get_proxy() -> StdioProxy:
@@ -528,6 +543,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         "/oauth/token",
         "/.well-known/oauth-authorization-server",
         "/.well-known/oauth-protected-resource",
+        # Continuous Capture v0.1.1.0 — these endpoints have their own internal
+        # auth (MEMPALACE_INTERNAL_API_TOKEN). Bearer middleware must not gate them.
+        "/api/mempalace/diary-write",
+        "/api/mempalace/beacon",      # Phase 1B (route added when 1B lands)
+        "/api/mempalace/heartbeat",   # Phase 1C (route added when 1C lands)
     )
 
     def __init__(self, app, expected_token: str) -> None:
@@ -671,6 +691,25 @@ async def mcp(request: Request) -> Response:
             status_code=500,
         )
 
+    # Continuous Capture activity pulse (v0.1.1.0 Phase 1A — D-CC2):
+    # every successful MCP request updates last_activity_at for the bearer
+    # token's hash. Best-effort: a failure here must NOT break the MCP response.
+    try:
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            bearer = auth_header.removeprefix("Bearer ").strip()
+            token_hash = cc_activity.hash_token(bearer)
+            params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+            meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+            cc_activity.record(
+                token_hash,
+                method=payload.get("method"),
+                thread_id=meta.get("thread_id"),
+                last_message_id=meta.get("message_id"),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cc.activity record failed (non-fatal): %s", exc)
+
     return JSONResponse(response)
 
 
@@ -678,7 +717,7 @@ async def mcp(request: Request) -> Response:
 @asynccontextmanager
 async def lifespan(app: Starlette):
     """Bootstrap palace state, spawn the proxy, hold it for the app's lifetime."""
-    global _proxy
+    global _proxy, _cc_sweeper_task, _cc_beacon_task, _cc_dead_detect_task
 
     palace_path = _get_palace_path()
     logger.info("startup: palace_path=%s", palace_path)
@@ -686,14 +725,66 @@ async def lifespan(app: Starlette):
     # A7 — first-boot bootstrap.
     bootstrap_if_needed(palace_path)
 
+    # Continuous-Capture v0.1.1.0 — initialize SQLite schema (idle_session,
+    # diary_write_queue, heartbeat). Idempotent on every boot.
+    cc_db_path = cc_db.init_db()
+    logger.info("continuous_capture db ready at %s", cc_db_path)
+
     # Spawn proxy.
     _proxy = StdioProxy(_get_subprocess_cmd())
     await _proxy.start()
+
+    # Continuous-Capture v0.1.1.0 — start the idle sweeper. Cancelled on
+    # graceful shutdown below. Set MEMPALACE_DISABLE_IDLE_SWEEPER=1 in tests
+    # that import the app without wanting the sweeper to fire.
+    disable_sweeper = os.environ.get("MEMPALACE_DISABLE_IDLE_SWEEPER", "").lower() in ("1", "true", "yes")
+    if not disable_sweeper:
+        _cc_sweeper_task = asyncio.create_task(
+            cc_sweeper.run_sweeper(_proxy),
+            name="cc-idle-sweeper",
+        )
+        logger.info("continuous_capture idle_sweeper task started")
+    else:
+        logger.info("continuous_capture idle_sweeper DISABLED via env (tests)")
+
+    # Phase 1B (v0.1.2.0) — beacon worker
+    if os.environ.get("MEMPALACE_DISABLE_BEACON_WORKER", "").lower() not in ("1", "true", "yes"):
+        _cc_beacon_task = asyncio.create_task(
+            cc_beacon.run_beacon_worker(_proxy),
+            name="cc-beacon-worker",
+        )
+        logger.info("continuous_capture beacon_worker task started")
+    else:
+        logger.info("continuous_capture beacon_worker DISABLED via env (tests)")
+
+    # Phase 1C (v0.1.3.0) — dead-thread detector
+    if os.environ.get("MEMPALACE_DISABLE_DEAD_DETECTOR", "").lower() not in ("1", "true", "yes"):
+        _cc_dead_detect_task = asyncio.create_task(
+            cc_heartbeat.run_dead_detector(_proxy),
+            name="cc-dead-detector",
+        )
+        logger.info("continuous_capture dead_detector task started")
+    else:
+        logger.info("continuous_capture dead_detector DISABLED via env (tests)")
+
     logger.info("startup complete")
 
     try:
         yield
     finally:
+        logger.info("shutdown: cancelling cc background tasks")
+        for task_name, task in (
+            ("cc-dead-detector", _cc_dead_detect_task),
+            ("cc-beacon-worker", _cc_beacon_task),
+            ("cc-idle-sweeper", _cc_sweeper_task),
+        ):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                logger.info("shutdown: %s cancelled", task_name)
         logger.info("shutdown: stopping subprocess")
         if _proxy:
             await _proxy.stop()
@@ -728,6 +819,29 @@ def create_app(bearer_token: str | None = None) -> Starlette:
                 "/.well-known/oauth-protected-resource",
                 _oauth.protected_resource_metadata,
                 methods=["GET"],
+            ),
+            # Continuous Capture v0.1.1.0 — Phase 1A diary-write endpoint.
+            # Gated by MEMPALACE_INTERNAL_API_TOKEN (separate from /mcp bearer).
+            # See continuous_capture/routes.py + Architecture v1.0 §4.2, §7.
+            Route(
+                "/api/mempalace/diary-write",
+                cc_routes.make_diary_write_route(_get_proxy),
+                methods=["POST"],
+            ),
+            # Continuous Capture v0.1.2.0 — Phase 1B beacon endpoint.
+            # No auth — sendBeacon cannot set Authorization headers; token is
+            # in the payload as token_hash; dedup is the guard. Spec §4.3, §7.
+            Route(
+                "/api/mempalace/beacon",
+                cc_beacon.make_beacon_route(_get_proxy),
+                methods=["POST"],
+            ),
+            # Continuous Capture v0.1.3.0 — Phase 1C heartbeat endpoint.
+            # Bearer-protected (same static bearer as /mcp).
+            Route(
+                "/api/mempalace/heartbeat",
+                cc_heartbeat.make_heartbeat_route(_get_bearer_token),
+                methods=["POST"],
             ),
             # Bearer-protected MCP (accepts static bearer OR OAuth-issued JWT)
             Route("/mcp", mcp, methods=["POST"]),
